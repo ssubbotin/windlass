@@ -312,12 +312,34 @@ broken by lowest index in CUDA, which is deterministic but is not torch's rule.
 
 ### Task 4: IndexShare and the attention mask
 
-**Files:** `src/glm_layer_runner.cuh`
+**DONE** — 2026-08-01. See `task-4-report.md`.
+
+**Files:** `src/glm_layer_runner.cuh`, `src/glm_kernels.cuh`, `src/glm_loader.cuh`,
+`src/infer_glm.cu`, `src/test_glm_layer.cu`, `src/test_glm_index_share.cu`
 
 Group leaders compute indices and cache them; members consume them. Apply `index_mask` in MLA attention, composed with the causal mask.
 
-- [ ] Remove the `T > index_topk` abort.
-- [ ] **Free-oracle gate:** at seq ≤ 2048 the sparse path must be **bit-identical** to the dense path. Not "within tolerance" — identical. Assert it in `test_glm_layer`.
+- [x] Remove the `T > index_topk` abort.
+- [x] **Free-oracle gate:** at seq ≤ 2048 the sparse path must be **bit-identical** to the dense path. Not "within tolerance" — identical. Assert it in `test_glm_layer`.
+
+`run_layer` gained an `IndexShare&`; owning layers call `launch_indexer_decode` on the `q_resid`
+(`w.s_qa`) and hidden state (`w.s_norm`) the main path already computed and publish the **raw**
+indices, `"shared"` layers pass them through untouched and `abort()` if there are none. `index_mask`
+is a `[T]` byte array (1 = drop) composed onto a causal base that stays structural in this decode
+form (`T = pos+1`); an index outside `[0,T)` unmasks nothing. The `T > index_topk` abort is replaced
+by a `T > max_seq` one. **The RoPE rotation was unified** — `rope_interleave_slice` moved verbatim
+into `glm_kernels.cuh` and Task 3's `indexer_rope_lead` copy deleted; the regression figure did not
+move, twice. A second, unrelated 2048-shaped cap surfaced when the first one was removed:
+`mla_decode_absorbed` keeps `T` floats in dynamic shared memory, which caps out at `T = 12288`, so a
+global-memory fallback (`LayerWeights::s_attn_scores`, allocated only when `max_seq` needs it) now
+carries the score array past that. Bit-identity of the two address spaces is asserted.
+
+Gate: `test_glm_chain` worst substep `1.6928e-06` (`attn_out L77`), top-5 exact at all 5 tokens —
+unchanged, on two consecutive runs. Bit-identity on layer 0: 0 differing words of 6144 on all four
+compared tensors. New `test_glm_index_share` (18 checks, no checkpoint needed) covers propagation
+across a whole group with a consume-and-clear negative control, the loud failure on a member with no
+indices, mask composition with a "dropping one key must change the output" control, non-causal
+indices, and the `T = 13000` regime.
 
 ---
 

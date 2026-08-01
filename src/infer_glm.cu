@@ -292,15 +292,11 @@ int main(int argc, char** argv) {
 
     c.max_seq = max_seq_arg > 0 ? (uint32_t)max_seq_arg
                                 : (uint32_t)prompt_ids.size() + n_gen + 8;
-    if (c.max_seq > c.index_topk) {
-        // run_layer aborts past index_topk (the indexer-free dense path stops
-        // being exact there). Fail here, with a message, instead of inside a
-        // kernel launch loop 78 layers deep.
-        fprintf(stderr, "max_seq %u exceeds index_topk %u — the dense attention "
-                        "path is only exact up to %u positions\n",
-                c.max_seq, c.index_topk, c.index_topk);
-        return 1;
-    }
+    // The `max_seq > index_topk` rejection that stood here until Task 4 is gone:
+    // run_layer now runs the DSA indexer and masks attention with its output, so
+    // above index_topk the path is sparse rather than absent. Below index_topk
+    // the top-k selects every key and the result is bit-identical to the old
+    // dense path.
 
     // --- resident weights ---------------------------------------------------
     st::ModelDir M;

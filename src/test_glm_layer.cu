@@ -235,18 +235,141 @@ static std::vector<float> download(const float* d, size_t n) {
     return h;
 }
 
+// --- long-context smoke test (Task 4) --------------------------------------
+// The question this answers is narrow and worth stating precisely: with the
+// `T > index_topk` abort gone, does a sequence longer than index_topk actually
+// run, or does it fail somewhere new? It is NOT a correctness test — above 2048
+// there is no oracle yet (that is Task 5, and `ref_glm_chain.py` still carries
+// the same 2048 limit), and the hidden states here are pseudo-random rather than
+// real activations.
+//
+// Layers 0,1,2,3 specifically: 0/1/2 are indexer OWNERS and are all below
+// first_k_dense_replace, so they cost nothing in expert traffic; 3 is the first
+// "shared" consumer, which is what makes IndexShare propagation observable at
+// T > index_topk. Running the full 78-layer chain instead would be the same test
+// plus ~2 hours of NVMe-bound expert streaming.
+static int smoke_long_context(const std::string& model_dir, uint32_t seq) {
+    glm::Config c;
+    if (!glm::load_config(model_dir, &c)) return 1;
+    c.max_seq = seq;
+    printf("long-context smoke: seq=%u, index_topk=%u (%s)\n", seq, c.index_topk,
+           seq > c.index_topk ? "ABOVE the removed abort" : "below index_topk");
+    if (seq <= c.index_topk)
+        printf("  WARNING: this seq does not exercise the sparse regime at all\n");
+
+    st::ModelDir M;
+    if (!st::open(&M, model_dir, /*allow_missing_shards=*/true)) {
+        fprintf(stderr, "st::open failed\n"); return 1;
+    }
+    const uint32_t NL = 4;
+    std::vector<glm::LayerWeights> W(NL);
+    for (uint32_t l = 0; l < NL; l++) {
+        if (!glm::load_layer(&M, c, l, &W[l])) return 1;
+        printf("  layer %u loaded (%s, %s)\n", l,
+               c.indexer_owner[l] ? "indexer owner" : "shared consumer",
+               l < c.dense_first ? "dense MLP" : "MoE");
+    }
+    const glm::ExpertLayout lay = glm::ExpertLayout::from(c);
+    StExpertSource src(&M, c, lay);
+
+    const uint32_t H = c.hidden;
+    float* d_hidden = nullptr;
+    CUDA_OK(cudaMalloc(&d_hidden, H * sizeof(float)));
+    std::vector<float> h_in(H);
+
+    glm::IndexShare share;
+    uint32_t s = 12345u;
+    for (uint32_t pos = 0; pos < seq; pos++) {
+        for (uint32_t i = 0; i < H; i++) {
+            s = s * 1664525u + 1013904223u;
+            h_in[i] = (((float)(s >> 8) / (float)(1u << 24)) * 2.0f - 1.0f) * 0.05f;
+        }
+        CUDA_OK(cudaMemcpy(d_hidden, h_in.data(), H * sizeof(float), cudaMemcpyHostToDevice));
+        share.reset();
+        for (uint32_t l = 0; l < NL; l++)
+            glm::run_layer(c, W[l], lay, src, l, pos, d_hidden, share, 0);
+
+        // Sample around the old cap and at the end. A NaN or an Inf here is the
+        // failure this test is looking for.
+        const bool sample = (pos + 2 >= c.index_topk && pos <= c.index_topk + 2) ||
+                            (pos % 512 == 0) || (pos + 1 == seq);
+        if (sample) {
+            CUDA_OK(cudaDeviceSynchronize());
+            CUDA_OK(cudaGetLastError());
+            const std::vector<float> h = download(d_hidden, H);
+            size_t bad = 0; double peak = 0;
+            for (float v : h) { if (!std::isfinite(v)) bad++; peak = std::fmax(peak, std::fabs((double)v)); }
+            if (bad || pos + 1 == seq || pos == c.index_topk)
+                printf("  pos %-5u T=%-5u non-finite=%zu peak=%.4e %s\n",
+                       pos, pos + 1, bad, peak, bad ? "FAIL" : "ok");
+            if (bad) g_fail = 1;
+        }
+    }
+    CUDA_OK(cudaDeviceSynchronize());
+    CUDA_OK(cudaGetLastError());
+
+    // --- what the run proves, asserted on values --------------------------
+    const uint32_t T = seq, K = (c.index_topk < T) ? c.index_topk : T;
+    uint32_t n2 = 0;
+    CUDA_OK(cudaMemcpy(&n2, W[2].idx_topk_n, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    printf("[smoke] layer 2 selected %u of %u keys (expected min(index_topk,T)=%u) %s\n",
+           n2, T, K, n2 == K ? "OK" : "FAIL");
+    if (n2 != K) g_fail = 1;
+
+    printf("[smoke] layer 3 consumed layer %u's indices (expected 2) %s\n",
+           share.producer, share.producer == 2 ? "OK" : "FAIL");
+    if (share.producer != 2) g_fail = 1;
+
+    auto mask_of = [&](uint32_t l) {
+        std::vector<uint8_t> m(T);
+        CUDA_OK(cudaMemcpy(m.data(), W[l].s_index_mask, T, cudaMemcpyDeviceToHost));
+        return m;
+    };
+    const std::vector<uint8_t> m0 = mask_of(0), m2 = mask_of(2), m3 = mask_of(3);
+    size_t kept2 = 0; for (uint8_t v : m2) if (!v) kept2++;
+    printf("[smoke] layer 2 mask keeps %zu of %u keys (expected %u) %s\n",
+           kept2, T, K, kept2 == K ? "OK" : "FAIL");
+    if (kept2 != K) g_fail = 1;
+
+    // The consumer's mask must equal its leader's, bit for bit — that is what
+    // "receives the leader's indices unchanged" means at T > index_topk.
+    const bool same23 = (std::memcmp(m2.data(), m3.data(), T) == 0);
+    printf("[smoke] layer 3's mask == layer 2's mask %s\n", same23 ? "OK" : "FAIL");
+    if (!same23) g_fail = 1;
+
+    // ...and that equality is only evidence if two DIFFERENT indexers really do
+    // select differently at this T. Layer 0 owns its own; it must disagree with
+    // layer 2, or the check above is vacuous.
+    size_t diff02 = 0; for (uint32_t i = 0; i < T; i++) if (m0[i] != m2[i]) diff02++;
+    printf("[smoke] layer 0's mask differs from layer 2's in %zu of %u keys "
+           "(must be > 0, else the equality above is vacuous) %s\n",
+           diff02, T, diff02 > 0 ? "OK" : "FAIL");
+    if (diff02 == 0) g_fail = 1;
+
+    cudaFree(d_hidden);
+    for (uint32_t l = 0; l < NL; l++) glm::free_layer(&W[l]);
+    st::close(&M);
+    printf("\n%s (long-context smoke, seq=%u)\n", g_fail ? "FAIL" : "RUNS CLEAN", seq);
+    return g_fail;
+}
+
 int main(int argc, char** argv) {
     std::string model_dir, oracle_dir;
     uint32_t layer = 3;
+    uint32_t smoke_seq = 0;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--model-dir") && i + 1 < argc) model_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--oracle") && i + 1 < argc) oracle_dir = argv[++i];
         else if (!std::strcmp(argv[i], "--layer") && i + 1 < argc) layer = (uint32_t)atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--smoke-seq") && i + 1 < argc) smoke_seq = (uint32_t)atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--keep-going")) g_keep_going = 1;
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 1; }
     }
+    if (!model_dir.empty() && smoke_seq > 0) return smoke_long_context(model_dir, smoke_seq);
     if (model_dir.empty() || oracle_dir.empty()) {
-        fprintf(stderr, "usage: %s --model-dir DIR --oracle DIR [--layer N]\n", argv[0]);
+        fprintf(stderr, "usage: %s --model-dir DIR --oracle DIR [--layer N]\n"
+                        "       %s --model-dir DIR --smoke-seq N   (long-context smoke)\n",
+                argv[0], argv[0]);
         return 1;
     }
     const std::string tag = oracle_dir + "/layer" + std::to_string(layer) + "_";
@@ -301,13 +424,29 @@ int main(int argc, char** argv) {
     // calls that are compared: attention at the last position needs all the earlier
     // ones cached, so there is no separate priming pass -- only the final call's
     // substeps are compared.
-    for (uint32_t pos = 0; pos < seq; pos++) {
-        CUDA_OK(cudaMemcpy(d_hidden, in_hidden.data() + (size_t)pos * H,
-                           H * sizeof(float), cudaMemcpyHostToDevice));
-        glm::run_layer(c, w, lay, src, layer, pos, d_hidden, 0);
-    }
-    CUDA_OK(cudaDeviceSynchronize());
-    CUDA_OK(cudaGetLastError());
+    //
+    // A layer taken out of its group has no leader to publish indexer indices for
+    // it, so a non-owning layer must be run in IndexShare's standalone-dense mode.
+    // An OWNING layer runs the full sparse path here, which is what makes the
+    // bit-identity gate below meaningful.
+    const bool owns_indexer = c.indexer_owner[layer];
+    printf("indexer: layer %u is \"%s\" (leader %u)\n", layer,
+           owns_indexer ? "full" : "shared", c.indexer_leader[layer]);
+
+    auto replay = [&](bool dense) {
+        glm::IndexShare share;
+        share.dense = dense;
+        for (uint32_t pos = 0; pos < seq; pos++) {
+            share.reset();
+            CUDA_OK(cudaMemcpy(d_hidden, in_hidden.data() + (size_t)pos * H,
+                               H * sizeof(float), cudaMemcpyHostToDevice));
+            glm::run_layer(c, w, lay, src, layer, pos, d_hidden, share, 0);
+        }
+        CUDA_OK(cudaDeviceSynchronize());
+        CUDA_OK(cudaGetLastError());
+    };
+
+    replay(/*dense=*/!owns_indexer);
 
     const size_t last = (size_t)(seq - 1) * H;
     auto ref_row = [&](const char* name) {
@@ -387,6 +526,72 @@ int main(int argc, char** argv) {
 
     compare("moe_out",       ref_row("moe_out"),       download(w.s_acc, H),   TOL_OUT);
     compare("output_hidden", ref_row("output_hidden"), download(d_hidden, H),  TOL_OUT);
+
+    // --- the free oracle: sparse == dense, BIT-IDENTICALLY, at seq <= index_topk
+    //
+    // Mechanism (Task 1, verified by executing the real GlmMoeDsaIndexer): the
+    // top-k is over min(index_topk, T) keys, so at T <= index_topk it returns a
+    // PERMUTATION OF ALL T INDICES, index_mask comes out uniformly False, and
+    // masked_fill writes nothing. The sparse path must therefore not merely agree
+    // with the dense one to some tolerance — it must produce the same bits.
+    //
+    // WHAT THIS PROVES, precisely: the plumbing. That the indexer runs without
+    // disturbing the main path, that IndexShare delivers something, that the mask
+    // is built and composed the right way round, and that removing the
+    // T > index_topk abort changed no arithmetic.
+    //
+    // WHAT IT DOES NOT PROVE: anything at all about the indexer's numbers. The
+    // mask is a no-op regardless of what the indexer computed, so a wrong
+    // LayerNorm eps, a missing relu or a swapped RoPE slice all pass this. Task 5's
+    // 4096-token oracle is the first test that touches the arithmetic. Do not read
+    // a green line here as validation of glm_kernels.cuh.
+    if (seq > c.index_topk) {
+        printf("[bit_identity] SKIPPED: seq=%u exceeds index_topk=%u, the mask is "
+               "no longer a no-op here\n", seq, c.index_topk);
+    } else if (!owns_indexer) {
+        printf("[bit_identity] SKIPPED: layer %u is \"shared\" and was run in "
+               "standalone-dense mode — there is no sparse run to compare\n", layer);
+    } else {
+        auto snap = [&]() {
+            std::vector<std::vector<float>> s;
+            s.push_back(download(tr.attn_out, H));
+            s.push_back(download(tr.post_attn_hidden, H));
+            s.push_back(download(w.s_acc, H));
+            s.push_back(download(d_hidden, H));
+            return s;
+        };
+        const std::vector<std::vector<float>> sparse = snap();   // the run just compared
+        replay(/*dense=*/true);
+        const std::vector<std::vector<float>> dense = snap();
+
+        static const char* NAMES[4] = {"attn_out", "post_attn_hidden", "moe_out",
+                                       "output_hidden"};
+        int identical = 1;
+        for (size_t k = 0; k < sparse.size(); k++) {
+            // memcmp, not a tolerance: -0.0 == 0.0 and NaN != NaN under `==`,
+            // and neither is what "the same bits" means.
+            const bool same = sparse[k].size() == dense[k].size() &&
+                              std::memcmp(sparse[k].data(), dense[k].data(),
+                                          sparse[k].size() * sizeof(float)) == 0;
+            size_t ndiff = 0; double worst = 0;
+            for (size_t i = 0; i < sparse[k].size(); i++)
+                if (std::memcmp(&sparse[k][i], &dense[k][i], sizeof(float))) {
+                    ndiff++;
+                    worst = std::fmax(worst, std::fabs((double)sparse[k][i] -
+                                                       (double)dense[k][i]));
+                }
+            printf("[bit_identity %s] differing words %zu/%zu worst_abs=%.3e %s\n",
+                   NAMES[k], ndiff, sparse[k].size(), worst, same ? "OK" : "FAIL");
+            if (!same) identical = 0;
+        }
+        if (!identical) {
+            printf("[bit_identity] FAIL — at seq=%u <= index_topk=%u the index mask "
+                   "is uniformly False, so the sparse path must be bit-identical to "
+                   "the dense one. Any difference is a plumbing bug.\n",
+                   seq, c.index_topk);
+            g_fail = 1;
+        }
+    }
 
     glm::g_trace = nullptr;
     cudaFree(tr.post_input_norm); cudaFree(tr.attn_out); cudaFree(tr.post_attn_hidden);

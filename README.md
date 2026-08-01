@@ -84,7 +84,7 @@ One of those deserves emphasis: **the LoRA-epsilon defect produced the exactly c
 
 ## Scope and limits
 
-- **Contexts ≤2048 tokens.** GLM-5.2's DSA sparse-attention indexer is not implemented; the engine aborts past `index_topk`. Below that threshold the selection is all-tokens and the dense path is numerically exact.
+- **Long-context arithmetic is not yet validated against an oracle.** GLM-5.2's DSA sparse-attention indexer is implemented and wired into attention, so the old `index_topk` (2048-token) abort is gone. Below `index_topk` the top-k selects every key, the index mask is a no-op, and the sparse path is *bit-identical* to the dense one — asserted in `test_glm_layer`. Above it the selection is real, and the only tests so far are structural; the 4096-token single-layer oracle that checks the indexer's numbers is still to come.
 - Single GPU. No tensor/pipeline parallelism.
 - Greedy decode. No batching, no serving API.
 - One model family so far.

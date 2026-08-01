@@ -16,7 +16,7 @@ HEADERS  = $(SRC)/glm_primitives.cuh $(SRC)/glm_kernels.cuh $(SRC)/glm_loader.cu
            $(SRC)/glm_layer_runner.cuh $(SRC)/glm_expert_cache.cuh $(SRC)/safetensors_io.cuh
 
 BINARIES = infer_glm test_glm_chain test_glm_layer test_glm_expert_cache test_glm_mxfp4 \
-           test_glm_indexer_loader test_glm_indexer
+           test_glm_indexer_loader test_glm_indexer test_glm_index_share
 
 all: infer_glm
 
@@ -36,6 +36,9 @@ test_glm_indexer_loader: $(SRC)/test_glm_indexer_loader.cu $(SRC)/glm_loader.cuh
 	$(NVCC) $(CFLAGS) -I$(SRC) -o $@ $< $(LDFLAGS)
 
 test_glm_indexer: $(SRC)/test_glm_indexer.cu $(SRC)/glm_kernels.cuh $(SRC)/glm_primitives.cuh
+	$(NVCC) $(CFLAGS) -I$(SRC) -o $@ $< $(LDFLAGS)
+
+test_glm_index_share: $(SRC)/test_glm_index_share.cu $(HEADERS)
 	$(NVCC) $(CFLAGS) -I$(SRC) -o $@ $< $(LDFLAGS)
 
 test_glm_mxfp4: $(SRC)/test_glm_mxfp4.cu $(SRC)/glm_kernels.cuh $(SRC)/glm_primitives.cuh
