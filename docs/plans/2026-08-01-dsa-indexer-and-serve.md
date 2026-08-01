@@ -385,15 +385,21 @@ rather than ~90.
 
 **Acceptance:**
 
-- [ ] `test_glm_chain` still reports **worst substep 1.6928e-06 and top-5 exact**. This is
-  the gate that proves a loop restructure preserved the numerics; it has been stable
-  across five tasks and three consecutive runs.
-- [ ] Prefill measured **before and after on the identical prompt**, both figures reported.
-  A speedup claimed against a remembered number is not a measurement.
-- [ ] Decode throughput unchanged within noise — report it, since a regression there
-  would mean the shared path drifted.
-- [ ] Expert-fetch count instrumented per prefill, before and after, to confirm the
-  reduction is real rather than inferred from wall-clock.
+- [x] `test_glm_chain` still reports **worst substep 1.6928e-06 and top-5 exact**. Unmoved,
+  and the run went through the new path (its 29-token prompt is a prefill).
+- [x] Prefill measured **before and after on the identical prompt**, one binary via
+  `--prefill layer|position`, page cache dropped before each: 256 tokens, **257.07 s ->
+  73.51 s** (1.00 -> 3.48 tok/s, 3.50x). After-only at 1400 tokens: **148.84 s, 9.41 tok/s**
+  against the ~90 minutes this plan projected.
+- [x] Decode throughput unchanged: **0.996 -> 0.971 tok/s** steady state (-2.5%, noise).
+  The 1.031 -> 0.777 seen over 11 steps is the prefill's cache residue, not the code — 6,600
+  decode fetches in both, 559 of them extra misses.
+- [x] Expert-fetch count instrumented (`glm::g_expert_fetches`, always on): 256 tokens
+  **153,600 -> 16,525**; 1400 tokens **840,000 by construction -> 18,917** (252.2 per MoE
+  layer against the 256 ceiling). `cache hits=0` across both layer-major prefills — no expert
+  requested twice.
+
+See `.superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-4b-report.md`.
 
 ---
 

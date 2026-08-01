@@ -277,6 +277,12 @@ struct SubstepHook : glm::ChainHook {
         snap[l] = s;
     }
 
+    // The fixtures are all at t=0, i.e. the last prompt position — which is the
+    // one position the layer-major prefill can serve (see ChainHook). Declaring
+    // it makes run_chain fail loudly if that ever stops being true, instead of
+    // leaving `seen` false and reporting "hook never fired".
+    uint32_t observed_pos() const override { return t0_pos; }
+
     void after_layer(uint32_t layer, uint32_t pos, const glm::LayerWeights& w,
                      const float* d_hidden, cudaStream_t stream) override {
         if (pos != t0_pos) return;
