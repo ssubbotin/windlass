@@ -1,0 +1,29 @@
+# Build artifacts
+infer_glm
+test_glm_chain
+test_glm_layer
+test_glm_expert_cache
+test_glm_mxfp4
+*.o
+
+# Model weights and derived data — never commit
+glm52-mxfp4/
+packed_experts/
+*.safetensors
+*.bin
+
+# Oracle and reference fixtures (regenerating is expensive; keep local)
+glm-oracle*/
+glm-ref/
+*.npy
+*.npz
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+*.swp
