@@ -285,12 +285,28 @@ before this task.
 
 ### Task 3: Indexer forward and top-k
 
-**Files:** `src/glm_kernels.cuh`, `src/glm_layer_runner.cuh`
+**DONE** — 2026-08-01. See `task-3-report.md`.
+
+**Files:** `src/glm_kernels.cuh`, `src/test_glm_indexer.cu`, `tools/ref_glm_indexer.py`
 
 Implement per Task 1's spec. Scores over 32 heads × 128 dim, combined via `weights_proj`, top-`index_topk` selected.
 
-- [ ] Kernel plus launcher, following the existing block-reduction conventions.
-- [ ] Unit test against a numpy reimplementation on random inputs, before any real weights.
+- [x] Kernel plus launcher, following the existing block-reduction conventions.
+- [x] Unit test against a numpy reimplementation on random inputs, before any real weights.
+
+Seven kernels plus `launch_indexer_{key,query,decode}`. `glm_layer_runner.cuh` untouched — the wire-up
+and the `T > index_topk` abort are Task 4's. Gate `TOL_REL = 1e-5`, derived from a measured baseline of
+`5.83e-07` (index_score, fp32 vs fp32 on identical keys), 17x margin. All four traps were injected into
+`glm_kernels.cuh` itself and each produced exit 1 — RMSNorm 1.05e-01, RoPE-trailing 1.64e+00,
+relu-after 1.00e+00, eps 2.08e-02 — **except that the eps defect is NOT caught at realistic hidden-state
+magnitudes** (2.51e-06, inside the gate); it needs the `--scale 0.01` fixture, because its effect scales
+as `eps/var(wk(x))`.
+
+Two findings that bear on Task 5: (a) the **bf16 indexer key cache** sets the end-to-end floor at
+`4.1e-04` on index scores, ~700x the arithmetic floor — 0.048% of key words round the other way between
+two fp32 implementations that agree to 5e-07, and the same `k[t]` feeds all 32 heads, so the head
+combination sums the perturbation coherently. Do not gate Task 5 on the index SET. (b) top-k ties are
+broken by lowest index in CUDA, which is deterministic but is not torch's rule.
 
 ---
 

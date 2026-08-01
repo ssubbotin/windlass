@@ -133,6 +133,57 @@ static std::vector<int32_t> load_npy_i32(const std::string& path) {
     return out;
 }
 
+// --- fixture pre-flight ----------------------------------------------------
+// The layers the substep fixtures were written for. File scope so the
+// pre-flight below can name the exact set of files this run will read.
+static const uint32_t SAMPLED[4] = {0, 3, 40, 77};
+
+// A MISSING ORACLE IS NOT A PASS. Without this, an absent or half-written
+// glm-ref/ surfaced either as an exit deep inside load_npy_raw — after the ~78
+// layers of weights had already been loaded, minutes in — or, for prompt.txt,
+// as the bare line "open glm-ref/prompt.txt" with no indication that the thing
+// missing was the oracle this test exists to compare against. Every file the
+// run will read is checked up front, and every missing one is named.
+static bool fixture_exists(const std::string& p) {
+    FILE* f = fopen(p.c_str(), "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+static bool require_fixtures(const std::string& ref_dir, const glm::Config& c,
+                             uint32_t n_gen) {
+    std::vector<std::string> want;
+    want.push_back(ref_dir + "/prompt.txt");
+    for (uint32_t l : SAMPLED) {
+        if (l >= c.n_layers) continue;
+        const std::string S = "_L" + std::to_string(l) + "_t0.npy";
+        for (const char* n : {"post_input_norm", "attn_out", "post_attn_hidden",
+                              "post_post_norm", "moe_out", "output_hidden"})
+            want.push_back(ref_dir + "/ref_chain_" + n + S);
+        if (l >= c.dense_first)
+            for (const char* n : {"router_logits", "topk_idx", "topk_w", "shared_out"})
+                want.push_back(ref_dir + "/ref_chain_" + n + S);
+    }
+    for (uint32_t t = 0; t < n_gen; t++) {
+        want.push_back(ref_dir + "/ref_chain_logits_" + std::to_string(t) + ".npy");
+        want.push_back(ref_dir + "/ref_chain_topk_" + std::to_string(t) + ".npy");
+    }
+    std::vector<std::string> missing;
+    for (const std::string& p : want) if (!fixture_exists(p)) missing.push_back(p);
+    if (missing.empty()) return true;
+    fprintf(stderr, "test_glm_chain: %zu of %zu oracle fixtures are missing under "
+                    "--ref %s — there is nothing to compare against, so this run "
+                    "is a FAILURE, not a pass:\n",
+            missing.size(), want.size(), ref_dir.c_str());
+    for (size_t i = 0; i < missing.size() && i < 12; i++)
+        fprintf(stderr, "  missing: %s\n", missing[i].c_str());
+    if (missing.size() > 12)
+        fprintf(stderr, "  ... and %zu more\n", missing.size() - 12);
+    fprintf(stderr, "regenerate them with tools/ref_glm_chain.py\n");
+    return false;
+}
+
 // --- comparison ------------------------------------------------------------
 static int    g_fail = 0;
 static int    g_report_only = 0;     // --report: print, never fail; used to derive TOL_REL
@@ -276,11 +327,17 @@ int main(int argc, char** argv) {
     glm::Config c;
     if (!glm::load_config(model_dir, &c)) return 1;
 
+    if (!require_fixtures(ref_dir, c, n_gen)) return 1;
+
     // --- prompt: the same 29 real token ids ref_glm_chain.py was driven with ---
     std::vector<uint32_t> ids;
     {
         FILE* f = fopen((ref_dir + "/prompt.txt").c_str(), "rb");
-        if (!f) { fprintf(stderr, "open %s/prompt.txt\n", ref_dir.c_str()); return 1; }
+        if (!f) {
+            fprintf(stderr, "test_glm_chain: cannot open the oracle prompt %s/prompt.txt\n",
+                    ref_dir.c_str());
+            return 1;
+        }
         std::string txt; char buf[4096]; size_t n;
         while ((n = fread(buf, 1, sizeof(buf), f)) > 0) txt.append(buf, n);
         fclose(f);
@@ -362,8 +419,7 @@ int main(int argc, char** argv) {
 
     SubstepHook hook;
     hook.c = c; hook.t0_pos = t0_pos; hook.trace = &tr;
-    const uint32_t sampled[4] = {0, 3, 40, 77};
-    for (uint32_t l : sampled) { if (l < c.n_layers) hook.add_layer(l); }
+    for (uint32_t l : SAMPLED) { if (l < c.n_layers) hook.add_layer(l); }
 
     // --- run: prompt, then greedy generation ---
     std::vector<std::vector<float>> got_logits;
@@ -389,7 +445,7 @@ int main(int argc, char** argv) {
 
     // --- per-substep comparison at the sampled layers, t = 0 ---
     printf("\n=== per-substep, t=0 (pos %u) ===\n", t0_pos);
-    for (uint32_t l : sampled) {
+    for (uint32_t l : SAMPLED) {
         if (l >= c.n_layers) continue;
         LayerSnap& s = hook.snap[l];
         if (!s.seen) { printf("layer %u: hook never fired — BUG in the test\n", l); g_fail = 1; continue; }
