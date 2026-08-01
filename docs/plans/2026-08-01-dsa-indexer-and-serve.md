@@ -261,13 +261,25 @@ top-k, not the matmul, is the decode-time cost to watch.
 
 ### Task 2: Load the indexer weights
 
+**DONE** — 2026-08-01. See `task-2-report.md`.
+
 **Files:** `src/glm_loader.cuh`
 
 Extend `LayerWeights` with the five indexer tensors, loaded only for the 21 owning layers; null elsewhere. Add an `indexer_owner[78]` map derived from the checkpoint rather than hardcoded, so a different model's layout does not silently mis-load.
 
-- [ ] Load, with dtype and shape assertions per tensor.
-- [ ] `free_layer` releases them.
-- [ ] A loader test asserts: 21 owners, correct group leader for every non-owning layer, layer 78 never loaded.
+- [x] Load, with dtype and shape assertions per tensor.
+- [x] `free_layer` releases them.
+- [x] A loader test asserts: 21 owners, correct group leader for every non-owning layer, layer 78 never loaded.
+
+`Config::indexer_owner[78]`/`indexer_leader[78]` parse `config.json`'s explicit `indexer_types` array
+(21 owners at `0,1,2,6,...,74`, matching Task 1 exactly). `weights_proj` is bf16 on disk, converted to fp32
+once at load (every downstream use is fp32 per Task 1's spec, so converting once beats converting per query
+token). The indexer's own KV cache (post-norm, post-RoPE 128-dim bf16 keys) is now budgeted in
+`alloc_scratch`/`free_scratch`, owning layers only — 256 B/position per owning layer, 5376 B/position summed
+across all 21. `load_layer` now rejects any `layer >= n_layers`, which is what keeps layer 78 (the MTP head)
+out categorically. New test binary `test_glm_indexer_loader` asserts all of the above on values, not text.
+Regression gate re-run clean: top-5 exact, worst substep `1.6928e-06` (`attn_out L77`) — unchanged from
+before this task.
 
 ---
 
