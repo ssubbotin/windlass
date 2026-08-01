@@ -448,10 +448,43 @@ See `.superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-5-report.md`.
 
 **Files:** `tools/ref_glm_chain.py`, `tools/check_ref_vs_oracle.py`
 
+**DONE** — 2026-08-02.
+
 Without this the full chain has no oracle above 2048.
 
-- [ ] Implement, validate against the transformers layer oracle at 4096.
-- [ ] Extend `--negative-controls` with the three indexer defects from Task 5.
+- [x] Implement, validate against the transformers layer oracle at 4096.
+- [x] Extend `--negative-controls` with the indexer defects from Task 5.
+
+**Outcome.** The reference's own sequence cap is gone and the indexer is transcribed per Task 1
+(`layer_norm` at `INDEXER_LN_EPS = 1e-6`, `wq_b` off the shared `q_resid`, `wk` off the raw hidden
+state, leading-64 interleaved RoPE, `relu` before the head combination, both scale factors, `topk =
+min(index_topk, T)`, True-means-drop mask onto a preserved causal base) plus `IndexShare` — leaders
+publish raw indices before the mask, `"shared"` layers pass them through unchanged, and a member with
+nothing published raises.
+
+Validated with `--oracle-long` against Task 5's 4096-token fixtures, layer 2 (owner) and layer 3
+(consumer), in two passes with separately derived gates. **With the oracle's selection forced in, the
+worst substep in either layer is `post_input_norm` — the injected input's own bf16 dtype — at
+3.2495e-03 / 2.2940e-03, and everything downstream of it is smaller** (`attn_out` 1.3149e-03 /
+7.8582e-04, `moe_out` ~8e-06, router top-8 exact). With its own selection the worst is `attn_out` at
+1.2215e-02 / 1.3769e-02, all of it the two boundary keys out of 2048 (99.90% set agreement). Gates:
+**1.0e-02** forced, **3.0e-02** native, **2.0e-02** on the index-score row (floor 3.9986e-03). Task
+5's ulp gates were not imported — different comparison, different metric.
+
+13 indexer negative controls. `k_norm` as an RMSNorm 11.4x, RoPE on the trailing 64 118x, `relu`
+after the combination 23.6x, permuted `weights_proj` 84.7x; `weights_proj * 2` is **bit-identical on
+every output** and is caught only by the index-score gate (251x), confirming Task 5's warning that a
+top-k makes any monotone rescaling invisible. Selection sensitivity on the pinned pass: 1 wrong key of
+2048 → 5.6x, 8 → 23.8x. **Three do not separate and are recorded as such**: `k_norm` eps 1e-6→1e-5
+(1.00x — the defect is the same size as the bf16 floor), and `index_topk` 2047 / 2049 (1.13x / 0.96x,
+matching Task 5's 1.20x / 0.92x on CUDA).
+
+Regression: `test_glm_chain` worst substep `1.6928e-06` (`attn_out L77`), top-5 exact at all 5 tokens;
+the short-context check reports its previous figures unchanged; and the 78-layer chain driver, run
+before and after on the same prompt, is **bit-identical on all 848 shared tensors** — the free oracle
+re-demonstrated on the numpy side, with all 21 leaders publishing and all 57 members consuming.
+
+See `.superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-6-report.md`.
 
 ---
 
