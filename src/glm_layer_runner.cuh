@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -105,6 +106,15 @@ struct Timing {
     double total() const { return attn + router + fetch + expert; }
 };
 inline Timing* g_timing = nullptr;
+
+// Expert-fetch request counter, always on and free (one host increment per
+// ExpertSource::get_async call). Timing::fetches counts the same events but only
+// exists under --timing, whose per-section cudaStreamSynchronize changes the
+// thing being measured; this one does not, which is what makes it usable as the
+// before/after evidence that a restructure fetched LESS rather than got luckier
+// with the cache. ExpertCache::hits()+misses() is the independent second witness:
+// it counts the same requests from inside the cache.
+inline uint64_t g_expert_fetches = 0;
 
 inline double glm_now() {
     struct timespec ts;
@@ -382,6 +392,7 @@ inline void run_moe(const Config& c, const LayerWeights& w, const ExpertLayout& 
     for (uint32_t k = 0; k < K; k++) {
         const double t_f0 = g_timing ? glm_now() : 0.0;
         uint8_t* blk = src.get_async(layer, (uint32_t)h_idx[k], stream);
+        g_expert_fetches++;
         if (g_timing) { fetch_acc += glm_now() - t_f0; g_timing->fetches++; }
         const uint8_t* gw = blk + lay.gw_off; const uint8_t* gs = blk + lay.gs_off;
         const uint8_t* uw = blk + lay.uw_off; const uint8_t* us = blk + lay.us_off;
@@ -481,10 +492,15 @@ struct IndexShare {
     }
 };
 
-// --- run_layer -------------------------------------------------------------
-inline void run_layer(const Config& c, const LayerWeights& w, const ExpertLayout& lay,
-                      ExpertSource& src, uint32_t layer, uint32_t pos,
-                      float* d_hidden, IndexShare& share, cudaStream_t stream)
+// --- run_attention ---------------------------------------------------------
+// input_layernorm -> MLA (with the DSA indexer and its mask) -> o_proj -> the
+// FIRST residual add. Everything run_layer used to do before run_moe, moved out
+// verbatim so that the layer-major prefill below can run this half for every
+// position of a layer before touching a single expert. run_layer still calls it
+// for the decode path, so decode executes the same instructions it always did.
+inline void run_attention(const Config& c, const LayerWeights& w, uint32_t layer,
+                          uint32_t pos, float* d_hidden, IndexShare& share,
+                          cudaStream_t stream)
 {
     const uint32_t H = c.hidden, HN = c.n_heads, DH = c.qk_head, L = c.kv_lora_rank;
     const double t_attn0 = g_timing ? glm_now() : 0.0;
@@ -618,7 +634,18 @@ inline void run_layer(const Config& c, const LayerWeights& w, const ExpertLayout
         g_timing->attn += glm_now() - t_attn0;
         g_timing->layers++;
     }
+}
 
+// --- run_layer -------------------------------------------------------------
+// One decoder layer for ONE position: attention half, then the MoE half. This is
+// the decode form and the position-major prefill form; the layer-major prefill
+// below calls the same two halves in the other order.
+inline void run_layer(const Config& c, const LayerWeights& w, const ExpertLayout& lay,
+                      ExpertSource& src, uint32_t layer, uint32_t pos,
+                      float* d_hidden, IndexShare& share, cudaStream_t stream)
+{
+    const uint32_t H = c.hidden;
+    run_attention(c, w, layer, pos, d_hidden, share, stream);
     // ---- MLP / MoE + residual ----  (run_moe applies post_attention_layernorm itself)
     run_moe(c, w, lay, src, layer, d_hidden, w.s_acc, stream);
     residual_add<<<(H + 255) / 256, 256, 0, stream>>>(d_hidden, w.s_acc, d_hidden, H);
@@ -643,9 +670,20 @@ struct ChainWeights {
 // same layer overwrites it, so a substep fixture must be snapshotted here.
 // Enqueue copies on `stream`; they are ordered against run_layer's work.
 // Null in production; no cost when unset, and no arithmetic depends on it.
+//
+// CONTRACT WITH THE LAYER-MAJOR PREFILL (Task 4b). That path runs one layer for
+// every position before moving on, so at the moment layer l is finished the
+// per-layer scratch holds the LAST position's values and nobody else's — the
+// earlier positions' s_logits / s_idx / s_w / s_shared / s_acc were overwritten
+// on the way through. It therefore fires after_layer exactly once per layer, at
+// the last prefill position. `observed_pos` is how a hook declares which single
+// position it is going to snapshot; run_chain refuses the run if that is not the
+// position the batched path can serve, rather than handing back a hook that
+// silently never fires. UINT32_MAX means "any", i.e. the hook does not care.
 struct ChainHook {
     virtual void after_layer(uint32_t layer, uint32_t pos, const LayerWeights& w,
                              const float* d_hidden, cudaStream_t stream) = 0;
+    virtual uint32_t observed_pos() const { return UINT32_MAX; }
     virtual ~ChainHook() = default;
 };
 
@@ -654,6 +692,295 @@ __global__ void embed_lookup_bf16(const uint16_t* __restrict__ tbl, uint32_t tok
                                   float* __restrict__ out, uint32_t hidden) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < hidden) out[i] = bf16_to_f32(tbl[(size_t)token * hidden + i]);
+}
+
+// --- layer-major prefill (Task 4b) -----------------------------------------
+//
+// The position-major loop below fetches every position's 8 experts
+// independently: 75 MoE layers x 8 experts x n_tokens fetches, against a cache
+// holding ~16% of the routed set, so it thrashes. A layer has only 256 experts
+// in total, so routing ALL positions of a layer at once bounds the layer's
+// fetches by 256 no matter how long the prompt is — 19,200 for the whole
+// prefill instead of 840,000 at 1400 tokens.
+//
+// Three things this does NOT change, deliberately:
+//
+//  * Decode. run_chain dispatches here only for n_tokens > 1; a single position
+//    runs the same run_layer loop it always did, not a batched form degenerating
+//    to one. There is no n == 1 case in this code to get wrong.
+//  * Causality. Positions are visited in ascending order INSIDE each layer, so
+//    when position i attends, rows 0..i-1 of this layer's KV cache (and of the
+//    indexer's key cache) have already been written by this same layer and rows
+//    > i have not been read: T = pos + 1 is still exactly the causal set. The
+//    ordering is the stream's, and every write and read is enqueued on it in
+//    that order.
+//  * Arithmetic. Per position the same kernels run on the same inputs, and the
+//    accumulation into s_acc keeps the position-major ORDER — k = 0..K-1 then
+//    the shared expert — even though the experts are now computed in a
+//    different order. That is what the [n, K, hidden] staging buffer is for:
+//    without it, expert-major accumulation would reassociate a float sum that
+//    test_glm_chain's 1.6928e-06 gate is measured to six digits on.
+//
+// SCRATCH SIZING (the plan asks for the numbers and the reason):
+//   hidden [n, 6144] f32        34.4 MB at n=1400  — unavoidable, the residual
+//                               stream of every position has to survive between
+//                               layers; this IS the restructure.
+//   norm   [n, 6144] f32        34.4 MB — post_attention_layernorm of every
+//                               position, computed once in the routing pass and
+//                               read again by each expert that wants it. Not
+//                               recomputing it is the point.
+//   expout [n, 8, 6144] f32    275.4 MB — the K per-position expert outputs,
+//                               held only to preserve summation order (above).
+//                               This is the one buffer that is a cost rather
+//                               than a necessity, and it is the reason the
+//                               per-expert work is batched over the ~44
+//                               positions routed to that expert rather than
+//                               over all n.
+//   idx    [n, min(index_topk, pos0+n)] i32   7.8 MB at n=1400 — the leader
+//                               layer's raw top-k PER POSITION. In the
+//                               position-major path a member reads the leader's
+//                               single idx_topk buffer within the same token;
+//                               here the leader has moved on to position n-1 by
+//                               the time a member runs, so each position's set
+//                               is copied out. Bounded by index_topk (2048), so
+//                               8 KB/position at worst, not n^2 without limit.
+//   Total 352 MB at n=1400, allocated for the duration of one prefill and freed
+//   after it. It comes out of the same free VRAM the expert cache is sized
+//   from, so it costs ~17 expert slots out of ~3000, i.e. 0.5% of residency.
+inline bool g_prefill_layer_major = true;
+
+struct PrefillBufs {
+    uint32_t  n = 0, H = 0, K = 0, stride_idx = 0;
+    float*    hidden = nullptr;   // [n, H]      residual stream, all positions
+    float*    norm   = nullptr;   // [n, H]      post_attention_layernorm
+    float*    expout = nullptr;   // [n, K, H]   routed expert outputs, pre-weight
+    int32_t*  idx    = nullptr;   // [n, stride_idx]  leader's raw top-k per position
+    int32_t*  h_idx  = nullptr;   // pinned [n, K]    router selections
+    float*    h_w    = nullptr;   // pinned [n, K]    router weights
+    std::vector<uint32_t> idx_n;  // [n] valid entries of idx[i]
+
+    bool alloc(const Config& c, uint32_t n_tokens, uint32_t pos0) {
+        n = n_tokens; H = c.hidden; K = c.n_experts_per_tok;
+        const uint32_t last = pos0 + n_tokens;          // exclusive
+        stride_idx = (c.index_topk < last) ? c.index_topk : last;
+        idx_n.assign(n, 0);
+        const size_t hb = (size_t)n * H * sizeof(float);
+        if (cudaMalloc(&hidden, hb) != cudaSuccess) return false;
+        if (cudaMalloc(&norm,   hb) != cudaSuccess) return false;
+        if (cudaMalloc(&expout, (size_t)n * K * H * sizeof(float)) != cudaSuccess) return false;
+        if (cudaMalloc(&idx, (size_t)n * stride_idx * sizeof(int32_t)) != cudaSuccess) return false;
+        // Pinned, so the per-position D2H of the router result does not turn
+        // into an implicit host sync n times per layer.
+        if (cudaHostAlloc((void**)&h_idx, (size_t)n * K * sizeof(int32_t),
+                          cudaHostAllocDefault) != cudaSuccess) return false;
+        if (cudaHostAlloc((void**)&h_w, (size_t)n * K * sizeof(float),
+                          cudaHostAllocDefault) != cudaSuccess) return false;
+        return true;
+    }
+    void free_() {
+        if (hidden) cudaFree(hidden);
+        if (norm)   cudaFree(norm);
+        if (expout) cudaFree(expout);
+        if (idx)    cudaFree(idx);
+        if (h_idx)  cudaFreeHost(h_idx);
+        if (h_w)    cudaFreeHost(h_w);
+        hidden = norm = expout = nullptr; idx = nullptr; h_idx = nullptr; h_w = nullptr;
+    }
+};
+
+// One MoE layer for every prefill position, expert-major. Same contract as
+// run_moe: reads b.hidden (pre-norm residual after attention), applies
+// post_attention_layernorm itself, and adds the block output back into b.hidden.
+inline void run_moe_batched(const Config& c, const LayerWeights& w,
+                            const ExpertLayout& lay, ExpertSource& src,
+                            uint32_t layer, PrefillBufs& b, cudaStream_t stream)
+{
+    const uint32_t H = c.hidden, I = c.moe_inter, E = c.n_routed_experts,
+                   K = c.n_experts_per_tok, n = b.n;
+    const uint32_t SI = c.moe_inter * c.n_shared;
+    const double t_moe0 = g_timing ? glm_now() : 0.0;
+
+    // ---- pass 1: norm + router for every position ----
+    for (uint32_t i = 0; i < n; i++) {
+        float* norm_i = b.norm + (size_t)i * H;
+        rms_norm_bf16<<<1, 256, 0, stream>>>(b.hidden + (size_t)i * H, w.post_attn_ln,
+                                             norm_i, H, c.rms_eps);
+        launch_matvec_bf16(w.router_w, norm_i, w.s_logits, E, H, stream);
+        router_sigmoid_topk<<<1, 256, 2 * E * sizeof(float), stream>>>(
+            w.s_logits, w.router_bias, w.s_w, w.s_idx, E, K,
+            c.routed_scaling, c.norm_topk_prob);
+        // Stream-ordered, so each copy runs before the next position's router
+        // overwrites s_idx/s_w. ONE host sync for the whole layer, after the
+        // loop, instead of run_moe's one per position.
+        cudaMemcpyAsync(b.h_idx + (size_t)i * K, w.s_idx, K * sizeof(int32_t),
+                        cudaMemcpyDeviceToHost, stream);
+        cudaMemcpyAsync(b.h_w + (size_t)i * K, w.s_w, K * sizeof(float),
+                        cudaMemcpyDeviceToHost, stream);
+    }
+    cudaStreamSynchronize(stream);
+    // A ChainHook reads w.s_norm as this layer's post_post_norm; leave the last
+    // position's there, which is the position the hook is allowed to observe.
+    cudaMemcpyAsync(w.s_norm, b.norm + (size_t)(n - 1) * H, H * sizeof(float),
+                    cudaMemcpyDeviceToDevice, stream);
+    if (g_timing) g_timing->router += glm_now() - t_moe0;
+    const double t_exp0 = g_timing ? glm_now() : 0.0;
+    double fetch_acc = 0.0;
+
+    // ---- pass 2: each unique expert fetched ONCE, applied to all its positions ----
+    std::vector<uint32_t> order;                       // unique experts, first-seen order
+    std::vector<std::vector<uint32_t>> where(E);       // expert -> packed i*K + k
+    order.reserve(E);
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t k = 0; k < K; k++) {
+            const int32_t e = b.h_idx[(size_t)i * K + k];
+            if (e < 0 || (uint32_t)e >= E) {
+                fprintf(stderr, "run_moe_batched: layer %u position %u slot %u routed to "
+                                "expert %d, outside [0,%u)\n", layer, i, k, e, E);
+                std::abort();
+            }
+            if (where[e].empty()) order.push_back((uint32_t)e);
+            where[e].push_back(i * K + k);
+        }
+
+    // ExpertCache::prefetch queues one IoTask per miss out of a 64-entry ring
+    // and only releases a task when get_async consumes it, so announcing all 256
+    // at once would exhaust the ring. Chunking keeps the pipelining (the reads
+    // for chunk c+1 overlap the compute for chunk c) and changes no fetch count:
+    // every unique expert is still fetched exactly once.
+    const size_t CHUNK = 32;
+    std::vector<int32_t> chunk;
+    for (size_t o = 0; o < order.size(); o += CHUNK) {
+        const size_t m = std::min(CHUNK, order.size() - o);
+        chunk.assign(order.begin() + o, order.begin() + o + m);
+        {
+            const double t_p0 = g_timing ? glm_now() : 0.0;
+            src.prefetch(layer, chunk.data(), (uint32_t)m, stream);
+            if (g_timing) fetch_acc += glm_now() - t_p0;
+        }
+        for (size_t j = 0; j < m; j++) {
+            const uint32_t e = order[o + j];
+            const double t_f0 = g_timing ? glm_now() : 0.0;
+            uint8_t* blk = src.get_async(layer, e, stream);
+            g_expert_fetches++;
+            if (g_timing) { fetch_acc += glm_now() - t_f0; g_timing->fetches++; }
+            const uint8_t* gw = blk + lay.gw_off; const uint8_t* gs = blk + lay.gs_off;
+            const uint8_t* uw = blk + lay.uw_off; const uint8_t* us = blk + lay.us_off;
+            const uint8_t* dw = blk + lay.dw_off; const uint8_t* ds = blk + lay.ds_off;
+            for (uint32_t slot : where[e]) {
+                const float* norm_i = b.norm + (size_t)(slot / K) * H;
+                launch_dequant_matvec_mxfp4(gw, gs, norm_i, w.s_gate, I, H, stream);
+                launch_dequant_matvec_mxfp4(uw, us, norm_i, w.s_up,   I, H, stream);
+                silu_mul<<<(I + 255) / 256, 256, 0, stream>>>(w.s_gate, w.s_up, w.s_mid, I);
+                launch_dequant_matvec_mxfp4(dw, ds, w.s_mid,
+                                            b.expout + (size_t)slot * H, H, I, stream);
+            }
+        }
+    }
+
+    // ---- pass 3: combine per position, in run_moe's order ----
+    // 0, then += w_k * e_k for k = 0..K-1 in slot order, then += shared. The
+    // expert outputs were computed in a different order above; the SUM is
+    // evaluated in the original one, so this is bit-identical to run_moe.
+    for (uint32_t i = 0; i < n; i++) {
+        float* hid_i = b.hidden + (size_t)i * H;
+        const float* norm_i = b.norm + (size_t)i * H;
+        cudaMemsetAsync(w.s_acc, 0, H * sizeof(float), stream);
+        for (uint32_t k = 0; k < K; k++)
+            axpy<<<(H + 255) / 256, 256, 0, stream>>>(
+                b.expout + (size_t)(i * K + k) * H, b.h_w[(size_t)i * K + k], w.s_acc, H);
+        launch_dequant_matvec_mxfp4(w.sh_gate_w, w.sh_gate_s, norm_i, w.s_gate, SI, H, stream);
+        launch_dequant_matvec_mxfp4(w.sh_up_w,   w.sh_up_s,   norm_i, w.s_up,   SI, H, stream);
+        silu_mul<<<(SI + 255) / 256, 256, 0, stream>>>(w.s_gate, w.s_up, w.s_mid, SI);
+        launch_dequant_matvec_mxfp4(w.sh_down_w, w.sh_down_s, w.s_mid, w.s_shared, H, SI, stream);
+        axpy<<<(H + 255) / 256, 256, 0, stream>>>(w.s_shared, 1.0f, w.s_acc, H);
+        residual_add<<<(H + 255) / 256, 256, 0, stream>>>(hid_i, w.s_acc, hid_i, H);
+    }
+
+    if (g_timing) {
+        cudaStreamSynchronize(stream);
+        g_timing->fetch  += fetch_acc;
+        g_timing->expert += (glm_now() - t_exp0) - fetch_acc;
+    }
+}
+
+// The whole prompt, layer by layer. Leaves the LAST position's hidden state in
+// cw.d_hidden, which is exactly what run_chain's model.norm + lm_head tail wants
+// — logits for earlier positions were never produced by the position-major form
+// either.
+inline void run_prefill_layer_major(
+    const Config& c, const std::vector<LayerWeights>& W, const ChainWeights& cw,
+    const ExpertLayout& lay, ExpertSource& src, const uint32_t* tokens,
+    uint32_t n_tokens, uint32_t pos0, ChainHook* hook, cudaStream_t stream)
+{
+    const uint32_t H = c.hidden;
+    PrefillBufs b;
+    if (!b.alloc(c, n_tokens, pos0)) {
+        fprintf(stderr, "run_prefill_layer_major: could not allocate %u positions of "
+                        "prefill scratch (%.2f GB); lower the expert cache capacity "
+                        "or shorten the prompt\n", n_tokens,
+                (double)((size_t)n_tokens * c.hidden * (2 + c.n_experts_per_tok) *
+                         sizeof(float)) / 1e9);
+        std::abort();
+    }
+
+    for (uint32_t i = 0; i < n_tokens; i++)
+        embed_lookup_bf16<<<(H + 255) / 256, 256, 0, stream>>>(
+            cw.embed, tokens[i], b.hidden + (size_t)i * H, H);
+
+    // M:715's `topk_indices = None`, once for the whole forward. The first layer
+    // is an owner and republishes for every position immediately; this flag is
+    // what makes a checkpoint whose layer 0 is "shared" abort on the first layer
+    // instead of reading uninitialised indices out of b.idx.
+    bool have_idx = false;
+    for (uint32_t l = 0; l < c.n_layers; l++) {
+        const bool owner = c.indexer_owner[l];
+
+        // ---- attention, every position, ascending (this IS the causal order) ----
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            IndexShare s;
+            if (!owner && have_idx) {
+                s.idx = b.idx + (size_t)i * b.stride_idx;
+                s.n   = b.idx_n[i];
+                s.producer = l;
+            }
+            // owner: run_attention publishes into s from w.idx_topk.
+            // "shared" with have_idx == false: s.idx is null and require()
+            // aborts, exactly as in the position-major path.
+            run_attention(c, W[l], l, pos0 + i, b.hidden + (size_t)i * H, s, stream);
+            if (owner) {
+                b.idx_n[i] = s.n;
+                // s.idx is W[l].idx_topk, one buffer reused by the next
+                // position. The copy is enqueued on the same stream, so it
+                // retires before that overwrite.
+                cudaMemcpyAsync(b.idx + (size_t)i * b.stride_idx, s.idx,
+                                (size_t)s.n * sizeof(int32_t),
+                                cudaMemcpyDeviceToDevice, stream);
+            }
+        }
+        if (owner) have_idx = true;
+
+        // ---- MoE / MLP ----
+        if (l < c.dense_first) {
+            // No routed experts at all below first_k_dense_replace, so there is
+            // nothing to amortise: run the existing per-position code.
+            for (uint32_t i = 0; i < n_tokens; i++) {
+                float* hid_i = b.hidden + (size_t)i * H;
+                run_moe(c, W[l], lay, src, l, hid_i, W[l].s_acc, stream);
+                residual_add<<<(H + 255) / 256, 256, 0, stream>>>(
+                    hid_i, W[l].s_acc, hid_i, H);
+            }
+        } else {
+            run_moe_batched(c, W[l], lay, src, l, b, stream);
+        }
+
+        if (hook) hook->after_layer(l, pos0 + n_tokens - 1, W[l],
+                                    b.hidden + (size_t)(n_tokens - 1) * H, stream);
+    }
+
+    cudaMemcpyAsync(cw.d_hidden, b.hidden + (size_t)(n_tokens - 1) * H,
+                    H * sizeof(float), cudaMemcpyDeviceToDevice, stream);
+    cudaStreamSynchronize(stream);
+    b.free_();
 }
 
 // Runs `n_tokens` decode steps at absolute positions [pos0, pos0 + n_tokens),
@@ -681,20 +1008,40 @@ inline void run_chain(const Config& c, const std::vector<LayerWeights>& W,
                       float* d_logits, ChainHook* hook, cudaStream_t stream)
 {
     const uint32_t H = c.hidden;
-    // M:715 — `topk_indices = None` at the top of every model forward, not once
-    // per model. Layer 0 is an owner and republishes immediately, so this reset
-    // never changes an answer; it is here so that a checkpoint whose layer 0 is
-    // "shared" fails loudly on the first token instead of silently reusing the
-    // previous token's indices.
-    IndexShare share;
-    for (uint32_t i = 0; i < n_tokens; i++) {
-        const uint32_t pos = pos0 + i;
-        share.reset();
-        embed_lookup_bf16<<<(H + 255) / 256, 256, 0, stream>>>(
-            cw.embed, tokens[i], cw.d_hidden, H);
-        for (uint32_t l = 0; l < c.n_layers; l++) {
-            run_layer(c, W[l], lay, src, l, pos, cw.d_hidden, share, stream);
-            if (hook) hook->after_layer(l, pos, W[l], cw.d_hidden, stream);
+    // PREFILL vs DECODE. n_tokens == 1 is decode and takes the position-major
+    // loop below unchanged — not a batched form collapsing to a batch of one,
+    // so there is no way for the restructure to drift into the decode path.
+    // n_tokens > 1 is prefill and amortises expert fetches across positions
+    // (Task 4b); g_prefill_layer_major = false restores the position-major
+    // prefill, which is the same code decode uses and is what the before/after
+    // measurement is taken against.
+    if (n_tokens > 1 && g_prefill_layer_major) {
+        if (hook && hook->observed_pos() != UINT32_MAX &&
+            hook->observed_pos() != pos0 + n_tokens - 1) {
+            fprintf(stderr, "run_chain: the layer-major prefill can only serve a hook "
+                            "at position %u (the last of the batch), but this hook "
+                            "observes %u. Set glm::g_prefill_layer_major = false to "
+                            "take the position-major path.\n",
+                    pos0 + n_tokens - 1, hook->observed_pos());
+            std::abort();
+        }
+        run_prefill_layer_major(c, W, cw, lay, src, tokens, n_tokens, pos0, hook, stream);
+    } else {
+        // M:715 — `topk_indices = None` at the top of every model forward, not
+        // once per model. Layer 0 is an owner and republishes immediately, so
+        // this reset never changes an answer; it is here so that a checkpoint
+        // whose layer 0 is "shared" fails loudly on the first token instead of
+        // silently reusing the previous token's indices.
+        IndexShare share;
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            const uint32_t pos = pos0 + i;
+            share.reset();
+            embed_lookup_bf16<<<(H + 255) / 256, 256, 0, stream>>>(
+                cw.embed, tokens[i], cw.d_hidden, H);
+            for (uint32_t l = 0; l < c.n_layers; l++) {
+                run_layer(c, W[l], lay, src, l, pos, cw.d_hidden, share, stream);
+                if (hook) hook->after_layer(l, pos, W[l], cw.d_hidden, stream);
+            }
         }
     }
     rms_norm_bf16<<<1, 256, 0, stream>>>(cw.d_hidden, cw.final_norm, cw.d_hnorm,

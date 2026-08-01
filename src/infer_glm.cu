@@ -221,7 +221,7 @@ static void usage(const char* prog) {
     fprintf(stderr,
         "usage: %s --model-dir DIR --packed DIR (--prompt TEXT | --token-ids \"id,...\")\n"
         "          [--tokens N] [--repeat N] [--cache-experts N] [--reserve-gb N]\n"
-        "          [--io-threads N]\n"
+        "          [--io-threads N] [--prefill layer|position]\n"
         "          [--timing] [--cache-telemetry] [--no-think] [--raw] [--ignore-eos]\n"
         "          [--max-seq L]\n", prog);
 }
@@ -248,6 +248,16 @@ int main(int argc, char** argv) {
         else if (a == "--reserve-gb"    && i + 1 < argc) reserve_gb    = (size_t)atoi(argv[++i]);
         else if (a == "--io-threads"    && i + 1 < argc) io_threads    = (uint32_t)atoi(argv[++i]);
         else if (a == "--max-seq"       && i + 1 < argc) max_seq_arg   = atoi(argv[++i]);
+        // Task 4b's A/B. "layer" routes all prompt positions of a layer at once
+        // and fetches each unique expert once; "position" is the pre-4b loop,
+        // one position through all 78 layers at a time. Decode is unaffected
+        // either way — it is a single position and never enters the batched path.
+        else if (a == "--prefill"       && i + 1 < argc) {
+            std::string m = argv[++i];
+            if      (m == "layer")    glm::g_prefill_layer_major = true;
+            else if (m == "position") glm::g_prefill_layer_major = false;
+            else { fprintf(stderr, "--prefill must be layer|position\n"); return 1; }
+        }
         else if (a == "--timing")          want_timing    = true;
         else if (a == "--cache-telemetry") want_telemetry = true;
         else if (a == "--no-think")        think          = false;
@@ -397,6 +407,7 @@ int main(int argc, char** argv) {
         const double t_req0 = now_s();
         // prefill: the whole prompt in one run_chain call, logits for the last
         // position only (run_chain's contract).
+        const uint64_t f0 = glm::g_expert_fetches;
         glm::run_chain(c, W, cw, lay, cache, ids.data(), (uint32_t)ids.size(), 0,
                        d_logits, nullptr, 0);
         CUDA_OK(cudaDeviceSynchronize());
@@ -404,6 +415,11 @@ int main(int argc, char** argv) {
         CUDA_OK(cudaMemcpy(logits.data(), d_logits, (size_t)c.vocab * sizeof(float),
                            cudaMemcpyDeviceToHost));
         const double t_prefill = now_s() - t_req0;
+        // Wall clock alone cannot tell "fetched less" from "got luckier with the
+        // cache", so count the fetches for the prefill on its own. hp/mp is the
+        // cache's independent count of the same requests.
+        const uint64_t prefill_fetches = glm::g_expert_fetches - f0;
+        const size_t hp = cache.hits() - h0, mp = cache.misses() - m0;
 
         auto argmax = [&]() {
             int best = 0;
@@ -470,6 +486,18 @@ int main(int argc, char** argv) {
                 t_prefill > 0 ? ids.size() / t_prefill : 0.0, ids.size(),
                 t_decode, decode_steps, tok_s_decode[r], tok_s_e2e[r],
                 hit_rate_req[r], hit_rate_cum[r]);
+        fprintf(stderr,
+                "[req %u prefill] mode=%s tokens=%zu | %.2fs | expert fetches %llu "
+                "(%.1f per position, %.1f per MoE layer) | cache hits=%zu misses=%zu\n"
+                "[req %u decode ] steps=%u | expert fetches %llu\n",
+                r + 1, glm::g_prefill_layer_major ? "layer-major" : "position-major",
+                ids.size(), t_prefill, (unsigned long long)prefill_fetches,
+                ids.size() ? (double)prefill_fetches / (double)ids.size() : 0.0,
+                (c.n_layers - c.dense_first)
+                    ? (double)prefill_fetches / (double)(c.n_layers - c.dense_first) : 0.0,
+                hp, mp,
+                r + 1, decode_steps,
+                (unsigned long long)(glm::g_expert_fetches - f0 - prefill_fetches));
         cache.print_stats("end-of-request");
 
         if (want_timing) {
