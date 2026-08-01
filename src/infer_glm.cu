@@ -124,14 +124,20 @@ static bool tok_open(TokClient* tc, const std::string& model_dir) {
         dup2(in_pipe[0], 0); close(in_pipe[1]);
         dup2(out_pipe[1], 1); close(out_pipe[0]);
         close(in_pipe[0]); close(out_pipe[1]);
-        const char* py = std::getenv("KIMI_PYTHON");
+        const char* py = std::getenv("WINDLASS_PYTHON");
         if (!py || !*py) py = "python3";
         char self[4096]; ssize_t sn = readlink("/proc/self/exe", self, sizeof(self) - 1);
         std::string script;
         if (sn > 0) {
             self[sn] = 0; std::string s = self; auto sl = s.find_last_of('/');
-            script = (sl == std::string::npos ? "" : s.substr(0, sl + 1)) + "kimi_tokenize.py";
-        } else script = "kimi_tokenize.py";
+            std::string dir = (sl == std::string::npos ? "" : s.substr(0, sl + 1));
+            // WINDLASS_TOKENIZER wins; otherwise next to the binary, then ./tools/.
+            const char* env = std::getenv("WINDLASS_TOKENIZER");
+            if (env && *env) script = env;
+            else if (access((dir + "tokenizer_server.py").c_str(), R_OK) == 0)
+                script = dir + "tokenizer_server.py";
+            else script = dir + "tools/tokenizer_server.py";
+        } else script = "tools/tokenizer_server.py";
         execlp(py, py, script.c_str(), "--model-dir", model_dir.c_str(), "serve", (char*)nullptr);
         _exit(127);
     }
