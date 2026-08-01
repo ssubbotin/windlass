@@ -11,6 +11,10 @@ layout. The CUDA path uses the absorbed MLA form, so an independent direct
 implementation here means the chain comparison cross-checks the absorption
 rather than repeating the same algebra twice.
 
+There is no sequence-length cap. The DSA indexer is implemented (see IndexShare
+and indexer_scores), so `seq > index_topk` is a real sparse forward here as it is
+in transformers -- not an abort, and not a dense forward wearing a sparse label.
+
 Citations below are `modeling_glm_moe_dsa.py:LINE` (`M:`) and
 `configuration_glm_moe_dsa.py:LINE` (`C:`), transformers 5.14.1.
 
@@ -39,6 +43,13 @@ from glm_mxfp4_numpy import dequant
 # NOT config.rms_norm_eps (1e-5), which reaches only input_layernorm /
 # post_attention_layernorm (M:588-589) and model.norm (M:667).
 LORA_NORM_EPS = 1e-6
+
+# The DSA indexer's k_norm is nn.LayerNorm(128, eps=1e-6) (M:199) -- the eps is a
+# hardcoded LITERAL at construction, so neither LORA_NORM_EPS's class-default
+# mechanism nor config.rms_norm_eps (1e-5) reaches it. Same numeric value as
+# LORA_NORM_EPS, different provenance; kept as its own name so changing one does
+# not silently change the other.
+INDEXER_LN_EPS = 1e-6
 
 
 def rms_norm(x, w, eps):
@@ -85,6 +96,20 @@ def rope_interleave(x, cos, sin):
     """
     a, b = x[..., 0::2], x[..., 1::2]
     return np.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1)
+
+
+def layer_norm(x, w, b, eps):
+    """torch.nn.LayerNorm over the last axis -- the indexer's k_norm (M:199).
+
+    LayerNorm, NOT RMSNorm: it subtracts the mean and it adds a bias. Both
+    differences are silent if you reuse this repo's rms_norm, which is why the
+    fifth indexer tensor (k_norm.bias) exists at all. `var` is the BIASED (1/N)
+    variance, as torch uses in normalization layers.
+    """
+    x = x.astype(np.float32)
+    mu = x.mean(-1, keepdims=True)
+    var = ((x - mu) ** 2).mean(-1, keepdims=True)
+    return (x - mu) / np.sqrt(var + eps) * w.astype(np.float32) + b.astype(np.float32)
 
 
 def silu(x):
@@ -223,6 +248,11 @@ def load_config(model_dir):
     assert c["hidden_act"] == "silu"
     assert not c["tie_word_embeddings"], "lm_head is expected to be its own tensor"
     qk_nope, qk_rope = c["qk_nope_head_dim"], c["qk_rope_head_dim"]
+    indexer_types = c["indexer_types"]
+    assert len(indexer_types) == c["num_hidden_layers"], \
+        f"indexer_types has {len(indexer_types)} entries for {c['num_hidden_layers']} layers"
+    assert set(indexer_types) <= {"full", "shared"}, sorted(set(indexer_types))
+    assert indexer_types[0] == "full", "layer 0 must own an indexer; nothing precedes it"
     return {
         "hidden": c["hidden_size"],
         "n_layers": c["num_hidden_layers"],
@@ -243,6 +273,14 @@ def load_config(model_dir):
         "norm_topk_prob": c["norm_topk_prob"],
         "dense_first": c["first_k_dense_replace"],
         "index_topk": c["index_topk"],
+        "index_heads": c["index_n_heads"],       # 32
+        "index_dim": c["index_head_dim"],        # 128
+        # Read the ownership map from config.json rather than re-deriving it from
+        # index_topk_freq/index_skip_topk_offset (C:145-149). The formula happens
+        # to agree on this checkpoint, but the explicit array is what transformers
+        # itself consults (M:417), so a model with a different layout cannot
+        # silently mis-load here.
+        "indexer_types": indexer_types,
         "vocab": c["vocab_size"],
         # C:153 -- __post_init__ overwrites head_dim with qk_rope_head_dim, so the
         # rotary table dim is 64. config.json's head_dim: 192 is dead.
@@ -254,9 +292,9 @@ def load_config(model_dir):
 def load_layer_weights(store, cfg, layer):
     """Stream one decoder layer's non-expert weights. ~660 MB in float32.
 
-    The indexer submodule (self_attn.indexer.*) is deliberately NOT loaded: at
-    T <= index_topk its top-k selection is every causally valid token, so it
-    cannot change the attention output (see layer_forward's assert).
+    The indexer submodule (self_attn.indexer.*) is loaded only for the 21 layers
+    config.json marks "full"; a "shared" layer has no tensors of its own and
+    consumes its group leader's selection through IndexShare.
     """
     p = f"model.layers.{layer}."
     W = {
@@ -270,6 +308,24 @@ def load_layer_weights(store, cfg, layer):
         "kv_b_proj": store.dequant_or_raw(p + "self_attn.kv_b_proj.weight"),
         "o_proj": store.dequant_or_raw(p + "self_attn.o_proj.weight"),
     }
+    if cfg["indexer_types"][layer] == "full":
+        q = p + "self_attn.indexer."
+        W["ix_wq_b"] = store.raw(q + "wq_b.weight")            # M:197 [4096, 2048]
+        W["ix_wk"] = store.raw(q + "wk.weight")                # M:198 [128, 6144]
+        W["ix_k_norm_w"] = store.raw(q + "k_norm.weight")      # M:199 [128]
+        W["ix_k_norm_b"] = store.raw(q + "k_norm.bias")        # M:199 -- LayerNorm has a bias
+        W["ix_weights_proj"] = store.raw(q + "weights_proj.weight")   # M:200 [32, 6144]
+        H, D = cfg["index_heads"], cfg["index_dim"]
+        assert W["ix_wq_b"].shape == (H * D, cfg["q_lora"]), W["ix_wq_b"].shape
+        assert W["ix_wk"].shape == (D, cfg["hidden"]), W["ix_wk"].shape
+        assert W["ix_k_norm_w"].shape == (D,) and W["ix_k_norm_b"].shape == (D,)
+        assert W["ix_weights_proj"].shape == (H, cfg["hidden"]), W["ix_weights_proj"].shape
+        # M:643 -- _keep_in_fp32_modules forces weights_proj to float32. Task 5
+        # measured what happens if it is not: attn_out moves 8.7 bf16 ulp, more
+        # than that layer's entire baseline, and 3 of 2048 selected keys change.
+        # ShardStore widens the bf16 on disk to f32; assert rather than assume.
+        for t in ("ix_weights_proj", "ix_wq_b", "ix_wk", "ix_k_norm_w", "ix_k_norm_b"):
+            assert W[t].dtype == np.float32, (t, W[t].dtype)
     if layer < cfg["dense_first"]:
         W["gate_proj"] = store.dequant_or_raw(p + "mlp.gate_proj.weight")
         W["up_proj"] = store.dequant_or_raw(p + "mlp.up_proj.weight")
@@ -329,6 +385,101 @@ def read_expert(packed, layer, e, cfg):
 
 
 # ---------------------------------------------------------------------------
+# The DSA indexer
+# ---------------------------------------------------------------------------
+# Transcribes GlmMoeDsaIndexer.forward (M:203-263) and the mask composition at
+# M:423-432. Every non-obvious choice below is one of Task 1's recorded traps.
+
+
+class IndexShare:
+    """`prev_topk_indices`, M:715-724.
+
+    transformers threads ONE variable through the layer loop: the model forward
+    initialises it to None (M:715), passes it into layer i (M:724) and overwrites
+    it with that layer's return (M:717). A "full" layer returns its own RAW
+    indices -- captured at M:408-415, BEFORE index_mask is built, so the
+    non-causal filler is still in them -- and a "shared" layer returns its input
+    UNCHANGED (M:417-419 -> M:453), which is what makes the selection propagate
+    across a whole group instead of stopping at the first consumer.
+
+    Reset one of these per forward (per token), not per model: a member must not
+    be able to consume a stale selection from an earlier position.
+    """
+
+    __slots__ = ("indices",)
+
+    def __init__(self, indices=None):
+        self.indices = indices
+
+
+def indexer_keys(x, W, cfg, pos, cos, sin):
+    """The indexer's cached key vector(s): post-k_norm, post-RoPE, M:236-245.
+
+    `x` is the input_layernorm output ([hidden] or [n, hidden]) -- the RAW hidden
+    state entering the attention block (M:408), NOT the compressed KV and NOT
+    q_resid. `pos` is a scalar or a matching array of absolute positions.
+    """
+    R = cfg["qk_rope"]
+    k = x.astype(np.float32) @ W["ix_wk"].T                          # M:198
+    k = layer_norm(k, W["ix_k_norm_w"], W["ix_k_norm_b"], INDEXER_LN_EPS)
+    # RoPE on the LEADING R of the 128 dims (M:237). The main attention path
+    # rotates the TRAILING 64 of its 256-dim head (M:387); the slice ends are
+    # opposite and getting it backwards produces plausible-looking garbage.
+    k_rot = rope_interleave(k[..., :R], cos[pos], sin[pos])           # M:240
+    return np.concatenate([k_rot, k[..., R:]], -1)
+
+
+def indexer_scores(q_resid, x, K_ix, W, cfg, pos, cos, sin):
+    """One query position's index scores over all T cached keys, M:232-252.
+
+    Returns (q, w, index_score) -- q [H, D], w [H], index_score [T], all float32.
+    """
+    H, D, R = cfg["index_heads"], cfg["index_dim"], cfg["qk_rope"]
+    # wq_b is a second head off the SHARED q-LoRA residual (M:197, M:409): the
+    # same q_resid the main path computed at M:385. There is no separate query
+    # projection from the hidden state.
+    q = (q_resid.astype(np.float32) @ W["ix_wq_b"].T).reshape(H, D)   # M:232-233
+    q = np.concatenate([rope_interleave(q[:, :R], cos[pos], sin[pos]), q[:, R:]], -1)
+    # relu sits BETWEEN the qk product and the head combination (M:247-248).
+    # Combining first and rectifying after is a different function.
+    s = np.maximum((q @ K_ix.T) * np.float32(D ** -0.5), 0.0)         # M:247-248
+    # Two scale factors, not one: D**-0.5 above and H**-0.5 here (M:201, M:251).
+    # weights_proj is fp32 (M:643) and so is its input (M:251).
+    w = (W["ix_weights_proj"] @ x.astype(np.float32)) * np.float32(H ** -0.5)
+    # Weighted sum over heads AFTER the relu -- one score per key, shared by all
+    # 32 indexer heads and by all 64 attention heads (M:252).
+    return q, w, (w[:, None] * s).sum(0, dtype=np.float32)
+
+
+def indexer_topk(index_score, index_topk):
+    """M:262-263. `topk = min(index_topk, T)`, so at T <= index_topk this returns
+    a permutation of every index and the resulting mask is uniformly False.
+
+    Ordering is irrelevant -- the indices are only ever scattered into a bool
+    mask (M:423-427), so only the selected SET matters. Task 5 measured 0 of 4096
+    combined scores exactly equal on real weights (the head weights have mixed
+    signs, so the sum is essentially never 0.0), so there is no tie tail to
+    handle here; index drift between implementations is boundary noise, not ties.
+    """
+    k = min(index_topk, index_score.shape[0])
+    return np.argsort(-index_score, kind="stable")[:k].astype(np.int32)
+
+
+def index_drop_mask(sel, T):
+    """M:423-427: ones(T, bool).scatter_(-1, topk_indices, False). True == DROP.
+
+    Selected indices are NOT guaranteed causal (Task 1 verified this on the real
+    class), so an index outside [0, T) is simply not present in this decode-form
+    cache and unmasks nothing. Causality is applied independently -- here it is
+    structural, since the cache holds exactly positions 0..pos.
+    """
+    drop = np.ones(T, bool)
+    sel = np.asarray(sel)
+    drop[sel[(sel >= 0) & (sel < T)]] = False
+    return drop
+
+
+# ---------------------------------------------------------------------------
 # One decoder layer
 # ---------------------------------------------------------------------------
 
@@ -336,10 +487,14 @@ def read_expert(packed, layer, e, cfg):
 # be compared name-for-name.
 TAPS = ["post_input_norm", "attn_out", "post_attn_hidden", "post_post_norm",
         "router_logits", "topk_idx", "topk_w", "shared_out", "moe_out",
-        "output_hidden"]
+        "output_hidden",
+        # indexer-side taps, present only on a "full" layer. Named to match
+        # dump_glm_oracle.py's trace_indexer capture points.
+        "indexer_q", "indexer_w", "indexer_index_score", "indexer_topk"]
 
 
-def layer_forward(h, W, cfg, pos, cos, sin, cache, packed, layer, taps=None):
+def layer_forward(h, W, cfg, pos, cos, sin, cache, packed, layer, taps=None,
+                  share=None, force_topk=None):
     """One decoder layer for ONE token at absolute position `pos`.
 
     h: [hidden] float32. cache: dict with 'k' [T, n_heads, qk_head] and
@@ -353,6 +508,14 @@ def layer_forward(h, W, cfg, pos, cos, sin, cache, packed, layer, taps=None):
     comparison tolerance while moving `moe_out` by an order of magnitude more.
     Comparing the taps against the oracle's per-substep dumps is what actually
     pins the layer down.
+
+    `share` is the IndexShare threaded through the layer loop (M:715-724). A
+    "full" layer publishes into it; a "shared" layer consumes it and raises if it
+    is empty, exactly as M:418 does. `force_topk`, if given, replaces the
+    selection used for the mask WITHOUT suppressing the indexer -- the
+    index-score taps stay real. It is the analogue of test_glm_layer's
+    --force-oracle-topk and exists to separate "the arithmetic is wrong" from
+    "the two implementations picked slightly different keys".
     """
     HN, NP, RP, VD = cfg["n_heads"], cfg["qk_nope"], cfg["qk_rope"], cfg["v_head"]
     DH, L, eps = NP + RP, cfg["kv_lora"], cfg["rms_eps"]
@@ -380,6 +543,31 @@ def layer_forward(h, W, cfg, pos, cos, sin, cache, packed, layer, taps=None):
     kv = (kc @ W["kv_b_proj"].T).reshape(HN, NP + VD)                      # M:391, head-major rows
     k_pass, v = kv[:, :NP], kv[:, NP:]                                     # M:392
 
+    # --- DSA indexer (M:406-419), between q_resid and the attention -----------
+    # It runs on EVERY forward of every "full" layer, prefill and decode alike;
+    # there is no fast path that skips it (M:406-415).
+    ixt = cfg["indexer_types"][layer]
+    if ixt == "full":
+        cache.setdefault("ik", []).append(indexer_keys(x, W, cfg, pos, cos, sin))
+        K_ix = np.stack(cache["ik"])                                       # M:245
+        q_ix, w_ix, isc = indexer_scores(q_resid, x, K_ix, W, cfg, pos, cos, sin)
+        sel = indexer_topk(isc, cfg["index_topk"])
+        tap("indexer_q", q_ix)
+        tap("indexer_w", w_ix)
+        tap("indexer_index_score", isc)
+        tap("indexer_topk", sel)
+        if share is not None:
+            share.indices = sel        # RAW indices, published BEFORE the mask
+    elif share is None or share.indices is None:
+        # M:418. Loudly, not silently: a "shared" layer with nothing published is
+        # a broken layer loop, and falling back to "select everything" would turn
+        # it into a dense layer that still looks plausible.
+        raise RuntimeError(
+            f"layer {layer} is \"shared\" and has no published indices; its group "
+            f"leader must run first (IndexShare is empty)")
+    else:
+        sel = share.indices            # passed through UNCHANGED (M:417-419)
+
     q_rot = rope_interleave(q_rot, cos[pos], sin[pos])                     # M:396
     k_rot = rope_interleave(k_rot, cos[pos], sin[pos])                     # M:396, one shared vector (MQA)
     k = np.concatenate([k_pass, np.broadcast_to(k_rot, (HN, RP))], -1)     # M:397, M:400
@@ -394,11 +582,15 @@ def layer_forward(h, W, cfg, pos, cos, sin, cache, packed, layer, taps=None):
     # checkpoint, so the YaRN mscale correction at M:361-366 does NOT apply.
     scale = DH ** -0.5
     s = np.einsum("hd,thd->ht", q, K).astype(np.float32) * scale
-    # No DSA mask: with total length T <= index_topk (2048) the indexer's
-    # topk(min(index_topk, T)) returns EVERY index (M:262-263), so index_mask is
-    # all-False and the masked_fill at M:432 is a no-op -- only causality
-    # survives, and decoding one token at a time is causal by construction.
-    assert K.shape[0] <= cfg["index_topk"], "past index_topk the indexer-free path is not exact"
+    # DSA mask (M:423-432). The causal mask is the BASE and is preserved --
+    # masked_fill only WRITES at index_mask, so a causally forbidden key stays
+    # forbidden whether or not the indexer named it. Here causality is structural
+    # (this decode form caches exactly positions 0..pos), so all that is left to
+    # apply is the drop set. At T <= index_topk `drop` is uniformly False and
+    # this is bit-identical to the dense path, which is Task 4's free oracle.
+    drop = index_drop_mask(force_topk if force_topk is not None else sel, K.shape[0])
+    if drop.any():
+        s = np.where(drop, -np.inf, s)
     p = np.exp(s - s.max(-1, keepdims=True))
     p /= p.sum(-1, keepdims=True)
     o = np.einsum("ht,thd->hd", p, V).reshape(HN * VD)                     # M:297
@@ -434,6 +626,46 @@ def layer_forward(h, W, cfg, pos, cos, sin, cache, packed, layer, taps=None):
     out = resid + y                                                        # M:620
     tap("output_hidden", out)
     return out, cache
+
+
+def prefill_kv(X, W, cfg, cos, sin, layer, cache=None, pos0=0, chunk=256):
+    """Fill `cache` with the K/V (and indexer keys) of every row of X, batched.
+
+    Each position's K/V depends only on that position's incoming hidden state, so
+    when the hidden states are GIVEN -- which is the case on the injection path,
+    where they come from the oracle -- the whole prefix can be computed in a few
+    GEMMs instead of 4096 GEMVs. The expressions are the same ones layer_forward
+    uses; only the matmul shapes differ. check_ref_vs_oracle --long asserts the
+    two agree before it trusts this, rather than taking that on faith.
+
+    This exists because the 4096-token cross-check is otherwise dominated by
+    recomputing a full layer (routing included, 8 MXFP4 experts read from disk)
+    at 4095 positions whose output is then discarded.
+    """
+    HN, NP, RP, VD = cfg["n_heads"], cfg["qk_nope"], cfg["qk_rope"], cfg["v_head"]
+    L, eps = cfg["kv_lora"], cfg["rms_eps"]
+    owner = cfg["indexer_types"][layer] == "full"
+    if cache is None:
+        cache = {"k": [], "v": [], "ik": []}
+    cache.setdefault("ik", [])
+    for c0 in range(0, X.shape[0], chunk):
+        xb = X[c0:c0 + chunk].astype(np.float32)
+        n = xb.shape[0]
+        pos = np.arange(pos0 + c0, pos0 + c0 + n)
+        x = rms_norm(xb, W["input_layernorm"], eps)                        # M:603
+        ckv = x @ W["kv_a_proj_with_mqa"].T                                # M:389
+        kc, k_rot = ckv[:, :L], ckv[:, L:]                                 # M:390
+        kc = rms_norm(kc, W["kv_a_layernorm"], LORA_NORM_EPS)              # M:391
+        kv = (kc @ W["kv_b_proj"].T).reshape(n, HN, NP + VD)
+        k_pass, v = kv[:, :, :NP], kv[:, :, NP:]                           # M:392
+        k_rot = rope_interleave(k_rot, cos[pos], sin[pos])                 # M:396
+        k = np.concatenate(
+            [k_pass, np.broadcast_to(k_rot[:, None, :], (n, HN, RP))], -1)  # M:397
+        cache["k"].extend(np.ascontiguousarray(k))
+        cache["v"].extend(np.ascontiguousarray(v))
+        if owner:
+            cache["ik"].extend(indexer_keys(x, W, cfg, pos, cos, sin))
+    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +723,8 @@ def main():
                          "(default: 0, 3, 40, 77)")
     ap.add_argument("--inject-hidden", help="[seq, hidden] float32 .npy to start from")
     ap.add_argument("--inject-layer", type=int, default=0)
+    ap.add_argument("--prev-topk", help="on the injection path, a leader layer's "
+                                        "topk_indices .npy for a \"shared\" --inject-layer")
     ap.add_argument("--inject-only", action="store_true",
                     help="run only --inject-layer; skip model.norm and lm_head")
     ap.add_argument("--dump-substeps", action="store_true",
@@ -534,12 +768,29 @@ def main():
     if args.inject_hidden:
         L0 = args.inject_layer
         inj, cos, sin, W = inject_setup(store, cfg, args.inject_hidden, L0)
-        cache = {"k": [], "v": []}
+        cache = {"k": [], "v": [], "ik": []}
+        prev = np.load(args.prev_topk).astype(np.int32) if args.prev_topk else None
+        if prev is not None and prev.ndim == 3:
+            prev = prev[0]
         for pos in range(inj.shape[0]):
             t0 = time.time()
             taps = {} if args.dump_substeps else None
+            # One IndexShare per position, as M:715 resets prev_topk_indices per
+            # forward. On a "shared" layer run in isolation there is no leader in
+            # this process, so the selection has to be supplied: --prev-topk, or
+            # -- below index_topk only -- the arange stand-in dump_glm_oracle.py
+            # uses at M:335-337, which is provably the same mask (all-False).
+            share = IndexShare()
+            if cfg["indexer_types"][L0] == "shared":
+                if prev is not None:
+                    share.indices = prev[pos] if prev.ndim == 2 else prev
+                elif inj.shape[0] <= cfg["index_topk"]:
+                    share.indices = np.arange(pos + 1, dtype=np.int32)
+                else:
+                    sys.exit(f"layer {L0} is \"shared\" and seq {inj.shape[0]} > "
+                             f"index_topk; pass --prev-topk <leader>/layerN_topk_indices.npy")
             h, cache = layer_forward(inj[pos], W, cfg, pos, cos, sin,
-                                     cache, args.packed, L0, taps)
+                                     cache, args.packed, L0, taps, share)
             if taps:
                 for name, val in taps.items():
                     np.save(os.path.join(args.out,
@@ -565,7 +816,7 @@ def main():
     n_layers = cfg["n_layers"]      # 78; layer 78 is the MTP head, out of scope
     total = len(ids) + args.tokens
     cos, sin = rope_tables(total + 8, cfg["rot"], cfg["rope_theta"])
-    caches = {l: {"k": [], "v": []} for l in range(n_layers)}
+    caches = {l: {"k": [], "v": [], "ik": []} for l in range(n_layers)}
     final_norm = store.raw("model.norm.weight")
 
     pos = 0
@@ -574,6 +825,9 @@ def main():
     while True:
         t0 = time.time()
         h = embed_row(store, tok)
+        # M:715 -- topk_indices starts as None on every forward, so a "shared"
+        # layer can only ever see a leader's selection from THIS position.
+        share = IndexShare()
         for layer in range(n_layers):
             W = load_layer_weights(store, cfg, layer)          # streams, then drops
             # t=0 is the step that consumes the LAST prompt token and emits the
@@ -581,7 +835,8 @@ def main():
             at_t0 = generated == 0 and pos == len(ids) - 1
             taps = {} if (args.dump_substeps and at_t0 and layer in dump_layers) else None
             h, caches[layer] = layer_forward(h, W, cfg, pos, cos, sin,
-                                             caches[layer], args.packed, layer, taps)
+                                             caches[layer], args.packed, layer,
+                                             taps, share)
             if taps:
                 for name, val in taps.items():
                     np.save(os.path.join(args.out,
