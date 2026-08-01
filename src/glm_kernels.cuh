@@ -109,6 +109,54 @@ inline void launch_dequant_matvec_mxfp4(
     dequant_matvec_mxfp4<<<dim3(N), dim3(128), 0, stream>>>(d_W, d_S, d_x, d_y, N, K);
 }
 
+// --- RoPE, interleaved-in / halves-out -------------------------------------
+// MOVED here from glm_layer_runner.cuh by Task 4, byte-for-byte: the main
+// attention path and the DSA indexer apply the SAME rotation to different
+// slices of different vectors, and Task 3 had to duplicate it because the
+// original lived in the header that includes this one. One definition now,
+// two callers, `rope_off` being the only difference (main path: qk_nope = 192,
+// indexer: 0). Nothing about the kernel body, its launch shape (blockDim =
+// rot/2) or its arithmetic changed in the move, which is what makes the
+// unification safe against test_glm_chain's substep gate.
+//
+// GLM applies DeepSeek-style *interleaved* RoPE (M:133-169, called at M:396 and
+// M:240). Reading M:164-168:
+//     q1, q2 = q[..., 0::2], q[..., 1::2]
+//     q_embed = cat([q1*cos - q2*sin, q2*cos + q1*sin], dim=-1)
+// i.e. the INPUT pairs are adjacent (2i, 2i+1) but the OUTPUT is the
+// halves layout [rot_dim/2 | rot_dim/2]. That is a permutation of the rope
+// slice, applied identically to q and k, so the q·k dot product is unchanged.
+// cos/sin are cat(freqs, freqs) (M:126) and only the first half is used
+// (M:161-162), so the table is rot_dim/2 = 32 entries per position with
+// inv_freq[i] = 1 / theta^(2i / rot_dim), rot_dim = qk_rope_head_dim = 64
+// (M:112-114 with dim = config.head_dim = qk_rope_head_dim, C:153).
+//
+// TRAP (Task 1, finding 6): the main path ropes the TRAILING 64 of its 256-dim
+// head (rope_off = qk_nope); the indexer ropes the LEADING 64 of its 128-dim
+// head (rope_off = 0). Opposite ends of the vector, same rotation.
+__global__ void rope_interleave_slice(
+    float* __restrict__ x,            // [n_vec, vec_dim]; rope slice at [rope_off, rope_off+rot)
+    const float* __restrict__ cos_p,  // [rot/2]
+    const float* __restrict__ sin_p,  // [rot/2]
+    uint32_t vec_dim, uint32_t rope_off, uint32_t rot)
+{
+    const uint32_t v    = blockIdx.x;
+    const uint32_t i    = threadIdx.x;
+    const uint32_t half = rot >> 1;
+    const bool     act  = (i < half);
+    float* p = x + (size_t)v * vec_dim + rope_off;
+    // Read both members of the interleaved pair before any write; the two halves
+    // of the output alias the input slice. No early `return` before the barrier —
+    // every thread of the block must reach __syncthreads().
+    float a = 0.f, b = 0.f, cc = 0.f, ss = 0.f;
+    if (act) { a = p[2 * i]; b = p[2 * i + 1]; cc = cos_p[i]; ss = sin_p[i]; }
+    __syncthreads();                      // every pair read before any write
+    if (act) {
+        p[i]        = a * cc - b * ss;
+        p[i + half] = b * cc + a * ss;
+    }
+}
+
 // ============================================================================
 // DSA sparse-attention indexer (Task 3)
 // ============================================================================
@@ -153,10 +201,10 @@ inline void launch_dequant_matvec_mxfp4(
 //     launch_indexer_decode with keys beyond `pos` must mask them itself, and
 //     must not treat the returned set as pre-filtered.
 //
-// The RoPE rotation below is the same transform as
-// glm_layer_runner.cuh::rope_interleave_slice with rope_off = 0. It is written
-// out again rather than shared because that kernel sits in the layer runner,
-// which includes this header; the two must stay in step.
+// The indexer's RoPE is rope_interleave_slice (above) with rope_off = 0. Task 3
+// had a private copy of it, `indexer_rope_lead`, because the original lived in
+// glm_layer_runner.cuh, which includes this header. Task 4 moved the kernel here
+// and deleted the copy — there is exactly one rotation in the repo now.
 
 // LayerNorm eps for indexer.k_norm — M:199, a literal, NOT Config::rms_eps.
 static const float INDEXER_LN_EPS = 1e-6f;
@@ -220,31 +268,6 @@ __global__ void indexer_k_layernorm(
 
     for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
         out[i] = (x[i] - mean) * inv * bf16_to_f32(w[i]) + bf16_to_f32(b[i]);
-}
-
-// Interleaved RoPE over the LEADING `rot` dims of each of gridDim.x vectors.
-// Input pairs are adjacent (2i, 2i+1); output is the halves layout
-// [rot/2 | rot/2] — same permutation the main path uses, applied identically
-// to q and k, so the q.k dot product is unaffected by it (M:161-168).
-// blockDim.x must be >= rot/2; every thread must reach the barrier, hence no
-// early return.
-__global__ void indexer_rope_lead(
-    float*       __restrict__ x,       // [n_vec, vec_dim], rope slice at [0, rot)
-    const float* __restrict__ cos_p,   // [rot/2]
-    const float* __restrict__ sin_p,   // [rot/2]
-    uint32_t vec_dim, uint32_t rot)
-{
-    const uint32_t half = rot >> 1;
-    const uint32_t i    = threadIdx.x;
-    const bool     act  = (i < half);
-    float* p = x + (size_t)blockIdx.x * vec_dim;
-    float a = 0.f, b = 0.f, cc = 0.f, ss = 0.f;
-    if (act) { a = p[2 * i]; b = p[2 * i + 1]; cc = cos_p[i]; ss = sin_p[i]; }
-    __syncthreads();                    // every pair read before any write
-    if (act) {
-        p[i]        = a * cc - b * ss;
-        p[i + half] = b * cc + a * ss;
-    }
 }
 
 // Append the post-norm, post-RoPE key to the indexer's own KV cache, in bf16.
@@ -413,7 +436,7 @@ inline void launch_indexer_key(
 {
     launch_matvec_bf16(wk, x, s_k, D, hidden, stream);
     indexer_k_layernorm<<<1, 128, 0, stream>>>(s_k, k_norm_w, k_norm_b, s_k, D, ln_eps);
-    indexer_rope_lead<<<1, rot / 2, 0, stream>>>(s_k, d_cos, d_sin, D, rot);
+    rope_interleave_slice<<<1, rot / 2, 0, stream>>>(s_k, d_cos, d_sin, D, 0, rot);
     indexer_store_k_bf16<<<(D + 127) / 128, 128, 0, stream>>>(
         s_k, k_cache + (size_t)pos * D, D);
 }
@@ -438,7 +461,7 @@ inline void launch_indexer_query(
     const float head_scale = rsqrtf((float)H);  // 32**-0.5,  M:251 — a SECOND, different scale
 
     launch_matvec_bf16(wq_b, q_resid, s_q, H * D, q_lora, stream);
-    indexer_rope_lead<<<H, rot / 2, 0, stream>>>(s_q, d_cos, d_sin, D, rot);
+    rope_interleave_slice<<<H, rot / 2, 0, stream>>>(s_q, d_cos, d_sin, D, 0, rot);
     indexer_head_weights<<<(H + 7) / 8, dim3(32, 8), 0, stream>>>(
         weights_proj, x, s_w, H, hidden, head_scale);
     indexer_scores_relu<<<(H * T + 7) / 8, dim3(32, 8), 0, stream>>>(
@@ -464,6 +487,55 @@ inline void launch_indexer_decode(
     launch_indexer_query(wq_b, weights_proj, q_resid, x, d_cos, d_sin, k_cache,
                          s_q, s_w, s_scores, s_index, out_idx, out_n,
                          H, D, rot, hidden, q_lora, pos + 1, index_topk, stream);
+}
+
+// --- index_mask (Task 4) ---------------------------------------------------
+// M:423-427:
+//     index_mask = ones([B,S,T], bool)
+//     index_mask.scatter_(-1, topk_indices, False)          # True == DROP
+//     attn_mask  = causal_mask.masked_fill(index_mask, finfo(dtype).min)
+//
+// Two properties of that composition, both load-bearing, both from Task 1:
+//
+//  * The CAUSAL mask is the BASE. masked_fill only writes `min` where index_mask
+//    is True, so a causally-forbidden key stays forbidden whether or not the
+//    indexer named it. The index set never *un*-masks anything.
+//  * The selected indices are NOT causal. Task 1 measured topk=4 returning
+//    [0,1,2,10] for query row 2. So causality must be applied INDEPENDENTLY and
+//    the index set must never be treated as pre-filtered.
+//
+// In this decode-form port the causal base is structural: the query is at
+// absolute position `pos`, the attention loop runs t in [0, T) with T = pos+1,
+// and every t in that range is causally allowed. The scatter below therefore
+// enforces causality by REFUSING to clear any index outside [0, T) — a
+// non-causal index simply unmasks nothing, which is exactly what
+// `causal.masked_fill(...)` does to it. Widening the attention loop past `pos`
+// (a prefill kernel, say) would break that and needs a real causal test here.
+//
+// Layout: one uint8 per key, 1 == drop. A separate byte array rather than the
+// additive float mask transformers uses, because the score buffer here is
+// shared memory owned by mla_decode_absorbed and the mask has to be built
+// before that kernel launches.
+
+__global__ void index_mask_fill(uint8_t* __restrict__ m, uint32_t T) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < T) m[i] = 1;
+}
+
+__global__ void index_mask_scatter(const int32_t* __restrict__ idx, uint32_t n,
+                                   uint8_t* __restrict__ m, uint32_t T) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int32_t v = idx[i];
+    if (v >= 0 && (uint32_t)v < T) m[v] = 0;   // causality: out-of-range unmasks nothing
+}
+
+// Builds the [T] drop-mask for one query position from `n` raw indexer indices.
+inline void launch_build_index_mask(const int32_t* d_idx, uint32_t n,
+                                    uint8_t* d_mask, uint32_t T,
+                                    cudaStream_t stream = 0) {
+    index_mask_fill<<<(T + 255) / 256, 256, 0, stream>>>(d_mask, T);
+    if (n) index_mask_scatter<<<(n + 255) / 256, 256, 0, stream>>>(d_idx, n, d_mask, T);
 }
 
 } // namespace glm

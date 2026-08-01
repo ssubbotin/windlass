@@ -142,40 +142,11 @@ __device__ __forceinline__ float block_reduce_max(float v) {
     return s[0];
 }
 
-// --- RoPE, interleaved-in / halves-out -------------------------------------
-// GLM applies DeepSeek-style *interleaved* RoPE (M:133-169, called at M:396 and
-// M:240). Reading M:164-168:
-//     q1, q2 = q[..., 0::2], q[..., 1::2]
-//     q_embed = cat([q1*cos - q2*sin, q2*cos + q1*sin], dim=-1)
-// i.e. the INPUT pairs are adjacent (2i, 2i+1) but the OUTPUT is the
-// halves layout [rot_dim/2 | rot_dim/2]. That is a permutation of the rope
-// slice, applied identically to q and k, so the q·k dot product is unchanged.
-// cos/sin are cat(freqs, freqs) (M:126) and only the first half is used
-// (M:161-162), so the table is rot_dim/2 = 32 entries per position with
-// inv_freq[i] = 1 / theta^(2i / rot_dim), rot_dim = qk_rope_head_dim = 64
-// (M:112-114 with dim = config.head_dim = qk_rope_head_dim, C:153).
-__global__ void rope_interleave_slice(
-    float* __restrict__ x,            // [n_vec, vec_dim]; rope slice at [rope_off, rope_off+rot)
-    const float* __restrict__ cos_p,  // [rot/2]
-    const float* __restrict__ sin_p,  // [rot/2]
-    uint32_t vec_dim, uint32_t rope_off, uint32_t rot)
-{
-    const uint32_t v    = blockIdx.x;
-    const uint32_t i    = threadIdx.x;
-    const uint32_t half = rot >> 1;
-    const bool     act  = (i < half);
-    float* p = x + (size_t)v * vec_dim + rope_off;
-    // Read both members of the interleaved pair before any write; the two halves
-    // of the output alias the input slice. No early `return` before the barrier —
-    // every thread of the block must reach __syncthreads().
-    float a = 0.f, b = 0.f, cc = 0.f, ss = 0.f;
-    if (act) { a = p[2 * i]; b = p[2 * i + 1]; cc = cos_p[i]; ss = sin_p[i]; }
-    __syncthreads();                      // every pair read before any write
-    if (act) {
-        p[i]        = a * cc - b * ss;
-        p[i + half] = b * cc + a * ss;
-    }
-}
+// --- RoPE ------------------------------------------------------------------
+// The rotation kernel itself, `rope_interleave_slice`, moved to glm_kernels.cuh
+// in Task 4 so that the main attention path and the DSA indexer share one
+// definition instead of two copies that have to be kept in step. Only the
+// host-side angle table stays here.
 
 // Host-side table for one position. rot = qk_rope_head_dim = 64, theta = 8e6.
 inline void rope_pos(float* cos_out, float* sin_out, uint32_t pos,
@@ -228,8 +199,21 @@ __global__ void mla_project_v(
     if (threadIdx.x == 0) out[idx] = acc;
 }
 
-// One block per head. Causal over t in [0, T); T = pos + 1 (this token included).
+// One block per head. Causal over t in [0, T); T = pos + 1 (this token included),
+// so the loop bound IS the causal mask and every key it visits is causally
+// allowed. That is the BASE mask; `index_mask` composes on top of it and can
+// only ever remove keys, never add them (M:423-432 — causal.masked_fill(...)).
 // s[t] = (q_abs[h] . kv_c[t] + q_rot[h] . k_rot[t]) * scaling
+//
+// `index_mask` (may be null): [T] bytes, 1 == drop, built by
+// launch_build_index_mask. When it is null, or uniformly 0 — which is what
+// min(index_topk, T) == T produces at T <= index_topk — the result is
+// BIT-IDENTICAL to the pre-Task-4 dense kernel: `s * scaling` is computed by the
+// same instructions and the select only chooses between it and -INFINITY.
+//
+// `scores_g` (may be null): global-memory home for the per-key score array when
+// T floats exceed the 48 KB dynamic-shared-memory limit. Same values, same
+// order, different address space — see LayerWeights::s_attn_scores.
 __global__ void mla_decode_absorbed(
     const float* __restrict__ q,        // [n_heads, qk_head]
     const float* __restrict__ q_abs,    // [n_heads, kv_lora]
@@ -237,10 +221,12 @@ __global__ void mla_decode_absorbed(
     const float* __restrict__ k_rot,    // [T, qk_rope]
     float*       __restrict__ ctx,      // [n_heads, kv_lora]
     uint32_t T, uint32_t qk_head, uint32_t qk_nope, uint32_t qk_rope,
-    uint32_t kv_lora, float scaling)
+    uint32_t kv_lora, float scaling,
+    const uint8_t* __restrict__ index_mask, float* scores_g)
 {
-    extern __shared__ float sh[];       // T floats
+    extern __shared__ float smem[];     // T floats when scores_g is null
     const uint32_t h = blockIdx.x;
+    float* sh = scores_g ? (scores_g + (size_t)h * T) : smem;
     const float* qa = q_abs + (size_t)h * kv_lora;
     const float* qr = q + (size_t)h * qk_head + qk_nope;
 
@@ -250,7 +236,11 @@ __global__ void mla_decode_absorbed(
         for (uint32_t c = 0; c < kv_lora; c++) s += qa[c] * kc[c];
         const float* kr = k_rot + (size_t)t * qk_rope;
         for (uint32_t r = 0; r < qk_rope; r++) s += qr[r] * kr[r];
-        sh[t] = s * scaling;
+        // transformers writes finfo(bf16).min and lets the softmax underflow it
+        // to zero (M:432); -INFINITY reaches the same zero exactly, and at least
+        // one key is always selected (k = min(index_topk, T) >= 1 and every
+        // returned index is in [0,T)), so the block max is never -INFINITY.
+        sh[t] = (index_mask && index_mask[t]) ? -INFINITY : s * scaling;
     }
     __syncthreads();
 
@@ -417,10 +407,84 @@ inline void run_moe(const Config& c, const LayerWeights& w, const ExpertLayout& 
     }
 }
 
+// Exact dynamic-shared-memory capacity of mla_decode_absorbed, from the driver.
+// This is NOT 48 KB: the kernel's two block reductions hold 32 floats each, and
+// that static usage comes out of the same 48 KB budget, so the real figure on
+// SM 12.0 is 48896. Assuming 49152 made every T in [12225, 12288] fail to launch
+// with `invalid argument` — measured, not theorised. Queried once and cached;
+// falls back to the conservative constant if the query itself fails.
+inline size_t mla_smem_capacity() {
+    static size_t cap = 0;
+    if (cap == 0) {
+        cudaFuncAttributes a{};
+        cap = (cudaFuncGetAttributes(&a, mla_decode_absorbed) == cudaSuccess &&
+               a.maxDynamicSharedSizeBytes > 0)
+              ? (size_t)a.maxDynamicSharedSizeBytes : MLA_SMEM_LIMIT;
+    }
+    return cap;
+}
+
+// --- IndexShare ------------------------------------------------------------
+// The CUDA equivalent of `prev_topk_indices`, the single variable
+// GlmMoeDsaModel.forward threads through its layer loop: initialised to None
+// (M:715), passed into layer i (M:724), overwritten by layer i's return (M:717).
+//
+// Three details from Task 1, each of which is a trap if you get it backwards:
+//
+//  1. The propagated value is the indexer's RAW return, captured BEFORE
+//     index_mask is built (M:408-415 -> M:453). It still contains the
+//     non-causal filler the top-k pulled out of the -inf tail. Publishing a
+//     cleaned-up or causally-filtered set here would be a different model.
+//  2. A "shared" layer passes its input through UNCHANGED (M:417-419 -> M:453).
+//     It does not consume-and-clear: propagation continues across the whole
+//     group, so layers 3, 4 AND 5 all see layer 2's indices. Clearing on first
+//     use would leave layers 4 and 5 with nothing and is the natural mistake.
+//  3. A "shared" layer that receives nothing RAISES (M:418). It does not fall
+//     back to dense attention. So does this: abort() with the layer named,
+//     because a silent dense fallback is a wrong answer that looks right.
+//
+// `idx` points into the leader's LayerWeights::idx_topk, which lives as long as
+// the layer weights do and is rewritten by the leader at the start of every
+// token. Members read it within the same token's pass, after the leader wrote
+// it, on the same stream — so no copy and no lifetime question.
+struct IndexShare {
+    const int32_t* idx      = nullptr;      // device [n], the leader's raw top-k
+    uint32_t       n        = 0;
+    uint32_t       producer = UINT32_MAX;   // which layer computed `idx`
+
+    // Standalone single-layer runs ONLY (test_glm_layer). A layer taken out of
+    // its group has no leader to publish for it, so `dense` says: mask nothing,
+    // and do not raise on a "shared" layer. run_chain never sets it. It is also
+    // the handle the bit-identity gate uses to run the same layer twice, once
+    // sparse and once dense, and compare the two bit for bit.
+    bool           dense    = false;
+
+    // M:715 — reset at the top of every model forward.
+    void reset() { idx = nullptr; n = 0; producer = UINT32_MAX; }
+
+    // An owning layer publishes; this is M:717's overwrite.
+    void publish(uint32_t layer, const int32_t* d_idx, uint32_t count) {
+        idx = d_idx; n = count; producer = layer;
+    }
+
+    // A "shared" layer consults. Passes the value through untouched (detail 2)
+    // and aborts if there is nothing to pass (detail 3).
+    void require(uint32_t layer) const {
+        if (dense) return;
+        if (!idx) {
+            fprintf(stderr,
+                    "IndexShare: layer %u is \"shared\" but no preceding layer "
+                    "published indexer indices (transformers raises here, "
+                    "modeling_glm_moe_dsa.py:418)\n", layer);
+            std::abort();
+        }
+    }
+};
+
 // --- run_layer -------------------------------------------------------------
 inline void run_layer(const Config& c, const LayerWeights& w, const ExpertLayout& lay,
                       ExpertSource& src, uint32_t layer, uint32_t pos,
-                      float* d_hidden, cudaStream_t stream)
+                      float* d_hidden, IndexShare& share, cudaStream_t stream)
 {
     const uint32_t H = c.hidden, HN = c.n_heads, DH = c.qk_head, L = c.kv_lora_rank;
     const double t_attn0 = g_timing ? glm_now() : 0.0;
@@ -466,18 +530,76 @@ inline void run_layer(const Config& c, const LayerWeights& w, const ExpertLayout
         rot_row, w.d_cos, w.d_sin, c.qk_rope, 0, c.qk_rope);
 
     const uint32_t T = pos + 1;
-    // Exactness bound for the indexer-free path — see Step 4.3.
-    if (T > c.index_topk) {
-        fprintf(stderr, "run_layer: seq %u exceeds index_topk %u; the dense path is "
-                        "no longer exact\n", T, c.index_topk);
+    // The `T > c.index_topk` abort that stood here until Task 4 is GONE — that
+    // was the 2048-token cap, and the DSA indexer below is what replaces it.
+    // What remains is a genuine bound: the KV cache the caller sized.
+    if (T > c.max_seq) {
+        fprintf(stderr, "run_layer: position %u exceeds max_seq %u — the KV cache "
+                        "has no row for it\n", pos, c.max_seq);
         std::abort();
+    }
+
+    // ---- DSA indexer (M:406-415) ----
+    // Runs on every forward of every "full" layer, prefill and decode alike, with
+    // no skip path. Its two inputs are DIFFERENT tensors of different widths and
+    // both already exist above — nothing here is recomputed:
+    //   wq_b  <- w.s_qa   = q_a_layernorm(q_a_proj(x)), the SAME q_resid the main
+    //                       path built at M:385 and hands to the indexer at M:409.
+    //   wk    <- w.s_norm = the raw input_layernorm output (M:603 -> M:408), 6144
+    //                       wide, not the compressed KV and not q_resid.
+    // d_cos/d_sin are the table for `pos` that the main path just uploaded; the
+    // indexer shares it (same 64-dim rope, same theta) but applies it to the
+    // LEADING 64 of its 128-dim head instead of the trailing 64 of 256.
+    if (c.indexer_owner[layer]) {
+        const uint32_t k_sel = (c.index_topk < T) ? c.index_topk : T;   // M:262
+        launch_indexer_decode(
+            w.idx_wq_b, w.idx_wk, w.idx_k_norm_w, w.idx_k_norm_b,
+            w.idx_weights_proj, w.s_qa, w.s_norm, w.d_cos, w.d_sin,
+            w.idx_k_cache,
+            w.s_iq, w.s_ik, w.s_iw, w.s_iscores, w.s_iindex,
+            w.idx_topk, w.idx_topk_n,
+            c.index_n_heads, c.index_head_dim, c.qk_rope, H, c.q_lora_rank,
+            pos, c.index_topk, INDEXER_LN_EPS, stream);
+        // Publish the RAW indices, before any mask is built (M:408-415 -> M:453).
+        share.publish(layer, w.idx_topk, k_sel);
+    } else {
+        // "shared": consume the group leader's, pass them on untouched, and
+        // abort rather than silently going dense if there are none (M:417-419).
+        share.require(layer);
+    }
+
+    // ---- index_mask, composed onto the causal base (M:423-432) ----
+    // Skipped entirely only in the standalone-dense test mode. In particular it
+    // is NOT skipped at T <= index_topk: there the top-k returns a permutation of
+    // all T keys, the mask comes out uniformly 0, and the whole point of the gate
+    // is that running it changes nothing bit-for-bit.
+    const uint8_t* d_index_mask = nullptr;
+    if (!share.dense) {
+        launch_build_index_mask(share.idx, share.n, w.s_index_mask, T, stream);
+        d_index_mask = w.s_index_mask;
+    }
+
+    // Per-key scores live in shared memory when they fit and in a global buffer
+    // when they do not; the arithmetic is identical either way.
+    const size_t smem = (size_t)T * sizeof(float);
+    float* scores_g = nullptr;
+    if (smem > mla_smem_capacity()) {
+        if (!w.s_attn_scores) {
+            fprintf(stderr, "run_layer: T=%u needs %zu B of per-key scratch, over the "
+                            "%zu B this kernel can take as dynamic shared memory, and "
+                            "no global fallback was allocated (max_seq=%u at load "
+                            "time)\n", T, smem, mla_smem_capacity(), c.max_seq);
+            std::abort();
+        }
+        scores_g = w.s_attn_scores;
     }
 
     mla_absorb_q<<<(HN * L + 3) / 4, dim3(32, 4), 0, stream>>>(
         w.s_q, w.kv_b_proj, w.s_qabs, HN, DH, c.qk_nope, c.v_head, L);
-    mla_decode_absorbed<<<HN, 256, T * sizeof(float), stream>>>(
+    mla_decode_absorbed<<<HN, 256, scores_g ? 0 : smem, stream>>>(
         w.s_q, w.s_qabs, w.kv_c_cache, w.k_rot_cache, w.s_ctx,
-        T, DH, c.qk_nope, c.qk_rope, L, 1.0f / std::sqrt((float)DH));
+        T, DH, c.qk_nope, c.qk_rope, L, 1.0f / std::sqrt((float)DH),
+        d_index_mask, scores_g);
     mla_project_v<<<(HN * c.v_head + 3) / 4, dim3(32, 4), 0, stream>>>(
         w.s_ctx, w.kv_b_proj, w.s_attn, HN, c.qk_nope, c.v_head, L);
     launch_matvec_bf16(w.o_proj, w.s_attn, w.s_acc, H, HN * c.v_head, stream);
@@ -559,12 +681,19 @@ inline void run_chain(const Config& c, const std::vector<LayerWeights>& W,
                       float* d_logits, ChainHook* hook, cudaStream_t stream)
 {
     const uint32_t H = c.hidden;
+    // M:715 — `topk_indices = None` at the top of every model forward, not once
+    // per model. Layer 0 is an owner and republishes immediately, so this reset
+    // never changes an answer; it is here so that a checkpoint whose layer 0 is
+    // "shared" fails loudly on the first token instead of silently reusing the
+    // previous token's indices.
+    IndexShare share;
     for (uint32_t i = 0; i < n_tokens; i++) {
         const uint32_t pos = pos0 + i;
+        share.reset();
         embed_lookup_bf16<<<(H + 255) / 256, 256, 0, stream>>>(
             cw.embed, tokens[i], cw.d_hidden, H);
         for (uint32_t l = 0; l < c.n_layers; l++) {
-            run_layer(c, W[l], lay, src, l, pos, cw.d_hidden, stream);
+            run_layer(c, W[l], lay, src, l, pos, cw.d_hidden, share, stream);
             if (hook) hook->after_layer(l, pos, W[l], cw.d_hidden, stream);
         }
     }

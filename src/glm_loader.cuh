@@ -305,6 +305,28 @@ struct LayerWeights {
     // 5376 B/position figure in the plan is the SUM across all 21 owning
     // layers, not this one buffer.
     uint16_t *idx_k_cache;       // [max_seq, index_head_dim] bf16, owning layers only
+    // --- indexer scratch + output (Task 4), owning layers only, else null ---
+    // Named s_i* to keep them clear of s_w / s_idx, which belong to the ROUTER
+    // and are a different length (n_experts_per_tok, not index_n_heads).
+    float   *s_iq;        // [index_n_heads * index_head_dim] post-RoPE indexer query
+    float   *s_ik;        // [index_head_dim]                 one key, pre-cache
+    float   *s_iw;        // [index_n_heads]                  weights_proj gates, fp32
+    float   *s_iscores;   // [index_n_heads * max_seq]        relu'd qk scores
+    float   *s_iindex;    // [max_seq]                        head-combined index score
+    int32_t *idx_topk;    // [index_topk]  raw top-k indices — the value IndexShare
+                          //               propagates, captured BEFORE index_mask
+                          //               is built (M:408-415 -> M:453), i.e. still
+                          //               containing non-causal entries.
+    uint32_t *idx_topk_n; // [1]           how many of idx_topk are valid
+    // --- attention masking (Task 4), every layer ---------------------------
+    uint8_t *s_index_mask;   // [max_seq] 1 == drop. Rebuilt per token per layer.
+    // Overflow buffer for mla_decode_absorbed's per-key score array. Normally
+    // that array is dynamic shared memory (T floats); above the 48 KB per-block
+    // limit there is no shared memory large enough, so the kernel reads the same
+    // values out of global memory instead. Same arithmetic, same order, only a
+    // different address space — allocated ONLY when max_seq is large enough to
+    // need it, null otherwise (see alloc_scratch).
+    float   *s_attn_scores;  // [n_heads * max_seq] or null
     // --- scratch: allocated ONLY by alloc_scratch below, never ad hoc ---
     // ALIASING RULE: s_acc is write-only inside run_moe (run_layer passes it as
     // d_out); nothing later accumulated into it may share it. That is why the
@@ -320,6 +342,24 @@ struct LayerWeights {
 // the per-layer KV cache. Called by load_layer before any upload. `owns_indexer`
 // must be Config::indexer_owner[layer] for the layer being loaded -- it gates
 // the indexer KV cache allocation below.
+// ALLOCATION trigger for the global per-key score buffer — deliberately NOT the
+// real shared-memory capacity, and deliberately well below it.
+//
+// The real capacity is a runtime property of the kernel, not a constant: it is
+// 48 KB minus whatever static __shared__ that kernel already uses.
+// mla_decode_absorbed's two block reductions hold 32 floats each, so on SM 12.0
+// cudaFuncGetAttributes reports maxDynamicSharedSizeBytes = 48896, not 49152 —
+// a 256-byte shortfall that made every T in [12225, 12288] fail to launch with
+// `invalid argument`. That is what an assumed constant buys you.
+//
+// run_layer now asks the driver for the exact figure (mla_smem_capacity()) and
+// switches to the global buffer against THAT. This constant only decides whether
+// the buffer is allocated at all, and being conservative here is nearly free:
+// it costs an unused n_heads*max_seq buffer for max_seq in (8192, ~12224], and
+// it guarantees the buffer exists whenever the exact check asks for it, since
+// the true capacity is never below 32 KB on any supported architecture.
+static constexpr size_t MLA_SMEM_LIMIT = 32u * 1024u;
+
 inline void alloc_scratch(const Config& c, LayerWeights* w, bool owns_indexer) {
     const uint32_t H  = c.hidden;                    // 6144
     const uint32_t SI = c.moe_inter * c.n_shared;    // shared-expert intermediate, M:563-565
@@ -375,8 +415,37 @@ inline void alloc_scratch(const Config& c, LayerWeights* w, bool owns_indexer) {
         w->idx_k_cache = nullptr;  // set below; keeps the branch symmetric with cudaMalloc's out-param
         GLM_CUDA_OK(cudaMalloc(&w->idx_k_cache,
                                (size_t)c.max_seq * c.index_head_dim * sizeof(uint16_t)));
+        // Indexer working set + its output. Owning layers only: a "shared" layer
+        // computes nothing and consumes its group leader's idx_topk (Task 4).
+        F(&w->s_iq,      (size_t)c.index_n_heads * c.index_head_dim);   // 4096
+        F(&w->s_ik,      c.index_head_dim);                             // 128
+        F(&w->s_iw,      c.index_n_heads);                              // 32
+        F(&w->s_iscores, (size_t)c.index_n_heads * c.max_seq);          // 32 * max_seq
+        F(&w->s_iindex,  c.max_seq);
+        GLM_CUDA_OK(cudaMalloc(&w->idx_topk, (size_t)c.index_topk * sizeof(int32_t)));
+        GLM_CUDA_OK(cudaMalloc(&w->idx_topk_n, sizeof(uint32_t)));
     } else {
         w->idx_k_cache = nullptr;
+        w->s_iq = w->s_ik = w->s_iw = w->s_iscores = w->s_iindex = nullptr;
+        w->idx_topk = nullptr;
+        w->idx_topk_n = nullptr;
+    }
+
+    // Drop-mask, EVERY layer — a "shared" layer masks with its leader's indices,
+    // so it needs its own mask buffer even though it owns no indexer.
+    GLM_CUDA_OK(cudaMalloc(&w->s_index_mask, c.max_seq * sizeof(uint8_t)));
+
+    // mla_decode_absorbed keeps T per-key scores. Dynamic shared memory covers
+    // that up to the 48 KB per-block limit, i.e. T <= 12288 at 4 B/key; past
+    // that the kernel needs a global buffer. n_heads * max_seq floats is 8.4 MB
+    // per layer at max_seq = 32768 — real memory, so it is allocated only when
+    // the shared-memory route provably cannot cover max_seq. Below the
+    // threshold this stays null and the kernel path is byte-identical to the
+    // pre-Task-4 one.
+    if ((size_t)c.max_seq * sizeof(float) > MLA_SMEM_LIMIT) {
+        F(&w->s_attn_scores, (size_t)c.n_heads * c.max_seq);
+    } else {
+        w->s_attn_scores = nullptr;
     }
 }
 
@@ -384,11 +453,16 @@ inline void free_scratch(LayerWeights* w) {
     for (float** p : {&w->s_norm, &w->s_qa, &w->s_q, &w->s_qabs, &w->s_ctx,
                       &w->s_attn, &w->s_kv, &w->s_logits, &w->s_w, &w->s_gate,
                       &w->s_up, &w->s_mid, &w->s_acc, &w->s_expert, &w->s_shared,
-                      &w->d_cos, &w->d_sin, &w->kv_c_cache, &w->k_rot_cache}) {
+                      &w->d_cos, &w->d_sin, &w->kv_c_cache, &w->k_rot_cache,
+                      &w->s_iq, &w->s_ik, &w->s_iw, &w->s_iscores, &w->s_iindex,
+                      &w->s_attn_scores}) {
         cudaFree(*p); *p = nullptr;
     }
     cudaFree(w->s_idx); w->s_idx = nullptr;
     cudaFree(w->idx_k_cache); w->idx_k_cache = nullptr;  // no-op on non-owning layers (null)
+    cudaFree(w->idx_topk);   w->idx_topk = nullptr;      // ditto
+    cudaFree(w->idx_topk_n); w->idx_topk_n = nullptr;
+    cudaFree(w->s_index_mask); w->s_index_mask = nullptr;
 }
 
 // Counterpart to load_layer: releases the weight tensors it uploaded AND the
