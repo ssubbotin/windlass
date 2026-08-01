@@ -25,6 +25,11 @@ namespace glm {
     fprintf(stderr, "CUDA: %s @ %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); \
     std::abort(); } } while (0)
 
+// Fixed-size backing for Config::indexer_owner / indexer_leader. 128 is headroom
+// over GLM-5.2's 78 layers; load_config fails loudly if n_layers exceeds it
+// rather than overrunning these arrays.
+static constexpr uint32_t MAX_INDEXER_LAYERS = 128;
+
 struct Config {
     // --- published in the Task 5 Interfaces block; unchanged ---
     uint32_t n_layers, hidden, n_routed_experts, n_experts_per_tok, moe_inter,
@@ -41,7 +46,26 @@ struct Config {
     bool     norm_topk_prob; // true
     uint32_t n_group, topk_group; // 1, 1
     uint32_t index_topk;     // 2048
+    uint32_t index_n_heads;  // 32   -- DSA indexer heads
+    uint32_t index_head_dim; // 128  -- DSA indexer head width
     uint32_t max_seq;        // KV-cache capacity, set by the caller (not from config.json)
+
+    // --- DSA indexer ownership (Task 2) --------------------------------
+    // Read verbatim from config.json's `indexer_types` array — NOT derived from
+    // the index_topk_freq/index_skip_topk_offset formula it happens to match on
+    // this checkpoint. Task 1 established the formula is not authoritative; a
+    // checkpoint whose layout disagrees with it must still load correctly.
+    // indexer_owner[i]:  true iff layer i's `indexer_types` entry is "full",
+    //                    i.e. layer i carries its own indexer.{wq_b,wk,k_norm,
+    //                    weights_proj} tensors.
+    // indexer_leader[i]: the owning layer whose indexer output layer i consumes
+    //                    -- itself, if indexer_owner[i] is true. Valid for
+    //                    i < n_layers only; UINT32_MAX beyond that (includes the
+    //                    out-of-range MTP layer 78, which has indexer tensors in
+    //                    the checkpoint but no indexer_types entry and is never
+    //                    loaded — see load_layer's bounds check).
+    bool     indexer_owner[MAX_INDEXER_LAYERS];
+    uint32_t indexer_leader[MAX_INDEXER_LAYERS];
 };
 
 // NOT config.rms_norm_eps. GlmMoeDsaAttention constructs its two LoRA norms as
@@ -101,6 +125,29 @@ static inline bool json_bool(const std::string& s, const char* key, bool* out) {
     return false;
 }
 
+// Reads a JSON array of strings, e.g. "indexer_types": ["full", "shared", ...].
+// Only what config.json's indexer_types needs: no escapes, no nesting.
+static inline bool json_string_array(const std::string& s, const char* key,
+                                     std::vector<std::string>* out) {
+    size_t q;
+    if (!json_find_value(s, key, &q)) return false;
+    if (q >= s.size() || s[q] != '[') return false;
+    size_t p = q + 1;
+    out->clear();
+    while (p < s.size() && s[p] != ']') {
+        while (p < s.size() && (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' ||
+                                s[p] == '\r' || s[p] == ',')) p++;
+        if (p >= s.size() || s[p] == ']') break;
+        if (s[p] != '"') return false;
+        size_t start = ++p;
+        while (p < s.size() && s[p] != '"') p++;
+        if (p >= s.size()) return false;
+        out->push_back(s.substr(start, p - start));
+        p++;  // skip closing quote
+    }
+    return p < s.size();  // found the closing ']'
+}
+
 inline bool load_config(const std::string& dir, Config* c) {
     std::string js;
     {
@@ -134,9 +181,56 @@ inline bool load_config(const std::string& dir, Config* c) {
     REQ("n_group",             c->n_group);
     REQ("topk_group",          c->topk_group);
     REQ("index_topk",          c->index_topk);
+    REQ("index_n_heads",       c->index_n_heads);
+    REQ("index_head_dim",      c->index_head_dim);
     REQ("rope_theta",          c->rope_theta);   // nested under rope_parameters; the
                                                  // scalar scan finds it regardless of nesting
     #undef REQ
+
+    if (c->n_layers > MAX_INDEXER_LAYERS) {
+        fprintf(stderr, "load_config: n_layers=%u exceeds MAX_INDEXER_LAYERS=%u\n",
+                c->n_layers, MAX_INDEXER_LAYERS);
+        return false;
+    }
+    // indexer_types is explicit in the checkpoint, one entry per layer (Task 1:
+    // do not derive this from the freq/offset formula). "full" = owns indexer
+    // weights and leads its own group; "shared" = consumes the nearest
+    // preceding owner's indices (M:417-419).
+    {
+        std::vector<std::string> itypes;
+        if (!json_string_array(js, "indexer_types", &itypes)) {
+            fprintf(stderr, "load_config: missing or malformed indexer_types\n");
+            return false;
+        }
+        if (itypes.size() != c->n_layers) {
+            fprintf(stderr, "load_config: indexer_types has %zu entries, expected "
+                            "n_layers=%u\n", itypes.size(), c->n_layers);
+            return false;
+        }
+        uint32_t leader = UINT32_MAX;
+        for (uint32_t i = 0; i < c->n_layers; i++) {
+            if (itypes[i] == "full") {
+                c->indexer_owner[i] = true;
+                leader = i;
+            } else if (itypes[i] == "shared") {
+                c->indexer_owner[i] = false;
+                if (leader == UINT32_MAX) {
+                    fprintf(stderr, "load_config: layer %u is \"shared\" with no "
+                                    "preceding owning layer\n", i);
+                    return false;
+                }
+            } else {
+                fprintf(stderr, "load_config: layer %u has unknown indexer_types "
+                                "value \"%s\"\n", i, itypes[i].c_str());
+                return false;
+            }
+            c->indexer_leader[i] = leader;
+        }
+        for (uint32_t i = c->n_layers; i < MAX_INDEXER_LAYERS; i++) {
+            c->indexer_owner[i] = false;
+            c->indexer_leader[i] = UINT32_MAX;
+        }
+    }
     c->qk_head = c->qk_nope + c->qk_rope;
     c->norm_topk_prob = json_bool(js, "norm_topk_prob", &b) ? b : true;
     // NOTE (config.json ignores head_dim on purpose): GlmMoeDsaConfig.__post_init__
@@ -187,6 +281,30 @@ struct LayerWeights {
     // but nothing ever read or updated it. The caller owns `pos`.
     float   *kv_c_cache;   // [max_seq, kv_lora_rank]  post-kv_a_layernorm compressed KV
     float   *k_rot_cache;  // [max_seq, qk_rope]       rope'd, NOT normalised
+    // --- DSA sparse-attention indexer (Task 2) ---------------------------
+    // Non-null ONLY when Config::indexer_owner[layer] is true; null on every
+    // "shared" layer, which consumes Config::indexer_leader[layer]'s output
+    // instead (Task 3/4) rather than having any of its own.
+    uint16_t *idx_wq_b;          // [index_n_heads*index_head_dim, q_lora_rank]  [4096, 2048] bf16
+    uint16_t *idx_wk;            // [index_head_dim, hidden]                    [ 128, 6144] bf16
+    uint16_t *idx_k_norm_w;      // [index_head_dim]                            [128]        bf16
+    uint16_t *idx_k_norm_b;      // [index_head_dim]                            [128]        bf16
+    // weights_proj is bf16 on disk like the other four indexer tensors, but
+    // transformers forces it to fp32 at inference (_keep_in_fp32_modules,
+    // modeling_glm_moe_dsa.py:643) and every downstream use of it is already in
+    // fp32 (the qk scores, the head combination, the top-k are all fp32 per
+    // Task 1). Converting once here at load time is strictly cheaper than
+    // decoding bf16->f32 on every query token in Task 3's kernel, so this is
+    // stored as float, already converted, not as the on-disk uint16_t.
+    float    *idx_weights_proj;  // [index_n_heads, hidden]                     [32, 6144]   fp32 (converted from bf16 at load)
+    // Indexer's OWN KV cache: post-k_norm, post-RoPE 128-dim keys, one per
+    // position, bf16. NOT derivable from kv_c_cache/k_rot_cache above -- wk
+    // reads the raw hidden state (input_layernorm output), which nothing else
+    // retains. Only allocated for owning layers (alloc_scratch); null
+    // elsewhere. Per-layer size is index_head_dim * 2 bytes/position; the
+    // 5376 B/position figure in the plan is the SUM across all 21 owning
+    // layers, not this one buffer.
+    uint16_t *idx_k_cache;       // [max_seq, index_head_dim] bf16, owning layers only
     // --- scratch: allocated ONLY by alloc_scratch below, never ad hoc ---
     // ALIASING RULE: s_acc is write-only inside run_moe (run_layer passes it as
     // d_out); nothing later accumulated into it may share it. That is why the
@@ -199,8 +317,10 @@ struct LayerWeights {
 };
 
 // Every device buffer whose size comes from Config: scratch, the RoPE table, and
-// the per-layer KV cache. Called by load_layer before any upload.
-inline void alloc_scratch(const Config& c, LayerWeights* w) {
+// the per-layer KV cache. Called by load_layer before any upload. `owns_indexer`
+// must be Config::indexer_owner[layer] for the layer being loaded -- it gates
+// the indexer KV cache allocation below.
+inline void alloc_scratch(const Config& c, LayerWeights* w, bool owns_indexer) {
     const uint32_t H  = c.hidden;                    // 6144
     const uint32_t SI = c.moe_inter * c.n_shared;    // shared-expert intermediate, M:563-565
 
@@ -243,6 +363,21 @@ inline void alloc_scratch(const Config& c, LayerWeights* w) {
     }
     F(&w->kv_c_cache,  (size_t)c.max_seq * c.kv_lora_rank);   // 512 f32 / position
     F(&w->k_rot_cache, (size_t)c.max_seq * c.qk_rope);        //  64 f32 / position
+
+    // Indexer KV cache — SIZING TRAP: this is a PER-LAYER allocation
+    // (index_head_dim * 2 bytes/position = 256 B/position at index_head_dim=128),
+    // not the plan's 5376 B/position figure, which is that number summed across
+    // all 21 owning layers. Sizing this one buffer to 5376 B/position would be a
+    // 21x overrun on every owning layer. Allocated ONLY for owning layers; every
+    // "shared" layer leaves idx_k_cache null and must look up its group leader's
+    // buffer instead (Task 3/4) rather than have one of its own.
+    if (owns_indexer) {
+        w->idx_k_cache = nullptr;  // set below; keeps the branch symmetric with cudaMalloc's out-param
+        GLM_CUDA_OK(cudaMalloc(&w->idx_k_cache,
+                               (size_t)c.max_seq * c.index_head_dim * sizeof(uint16_t)));
+    } else {
+        w->idx_k_cache = nullptr;
+    }
 }
 
 inline void free_scratch(LayerWeights* w) {
@@ -253,6 +388,7 @@ inline void free_scratch(LayerWeights* w) {
         cudaFree(*p); *p = nullptr;
     }
     cudaFree(w->s_idx); w->s_idx = nullptr;
+    cudaFree(w->idx_k_cache); w->idx_k_cache = nullptr;  // no-op on non-owning layers (null)
 }
 
 // Counterpart to load_layer: releases the weight tensors it uploaded AND the
@@ -264,7 +400,8 @@ inline void free_layer(LayerWeights* w) {
     for (uint16_t** p : {&w->input_ln, &w->post_attn_ln, &w->q_a_ln, &w->kv_a_ln,
                          &w->q_a_proj, &w->q_b_proj, &w->kv_a_proj_with_mqa,
                          &w->kv_b_proj, &w->o_proj, &w->router_w,
-                         &w->mlp_gate, &w->mlp_up, &w->mlp_down}) {
+                         &w->mlp_gate, &w->mlp_up, &w->mlp_down,
+                         &w->idx_wq_b, &w->idx_wk, &w->idx_k_norm_w, &w->idx_k_norm_b}) {
         cudaFree(*p); *p = nullptr;
     }
     for (uint8_t** p : {&w->sh_gate_w, &w->sh_gate_s, &w->sh_up_w,
@@ -272,7 +409,8 @@ inline void free_layer(LayerWeights* w) {
         cudaFree(*p); *p = nullptr;
     }
     cudaFree(w->router_bias); w->router_bias = nullptr;
-    free_scratch(w);
+    cudaFree(w->idx_weights_proj); w->idx_weights_proj = nullptr;
+    free_scratch(w);   // also releases idx_k_cache
 }
 
 // --- tensor upload helpers -------------------------------------------------
@@ -311,7 +449,16 @@ inline bool upload_raw(st::ModelDir* M, const std::string& name, T** dst,
 // Step 4.0). Calls alloc_scratch() before uploading anything.
 inline bool load_layer(st::ModelDir* M, const Config& c, uint32_t layer, LayerWeights* out) {
     std::memset(out, 0, sizeof(*out));
-    alloc_scratch(c, out);
+    if (layer >= c.n_layers) {
+        // Also how layer 78 — the MTP head, which carries indexer.* tensors in
+        // the checkpoint but has no indexer_types entry and is out of scope
+        // (Task 1) — is kept out: it is simply never a valid `layer` argument.
+        fprintf(stderr, "load_layer: layer %u out of range (n_layers=%u)\n",
+                layer, c.n_layers);
+        return false;
+    }
+    const bool owns_indexer = c.indexer_owner[layer];
+    alloc_scratch(c, out, owns_indexer);
 
     const std::string P = "model.layers." + std::to_string(layer) + ".";
     const uint32_t H = c.hidden, I = c.moe_inter, SI = c.moe_inter * c.n_shared;
@@ -332,6 +479,46 @@ inline bool load_layer(st::ModelDir* M, const Config& c, uint32_t layer, LayerWe
     BF16("self_attn.kv_a_proj_with_mqa.weight", kv_a_proj_with_mqa, (size_t)(c.kv_lora_rank + c.qk_rope) * H);
     BF16("self_attn.kv_b_proj.weight",          kv_b_proj,          (size_t)c.n_heads * (c.qk_nope + c.v_head) * c.kv_lora_rank);
     BF16("self_attn.o_proj.weight",             o_proj,             (size_t)H * c.n_heads * c.v_head);
+
+    // --- DSA indexer (Task 2), owning layers only -------------------------
+    if (owns_indexer) {
+        const uint32_t IH = c.index_n_heads, ID = c.index_head_dim;   // 32, 128
+        BF16("self_attn.indexer.wq_b.weight",   idx_wq_b,     (size_t)IH * ID * c.q_lora_rank);
+        BF16("self_attn.indexer.wk.weight",     idx_wk,       (size_t)ID * H);
+        BF16("self_attn.indexer.k_norm.weight", idx_k_norm_w, ID);
+        BF16("self_attn.indexer.k_norm.bias",   idx_k_norm_b, ID);
+
+        // weights_proj: bf16 on disk (checkpoint-verified, Task 1), converted to
+        // fp32 here — see the LayerWeights::idx_weights_proj comment for why.
+        {
+            const std::string name = P + "self_attn.indexer.weights_proj.weight";
+            const st::Tensor* t = st::info(M, name);
+            if (!t) { fprintf(stderr, "load_layer: missing tensor %s\n", name.c_str()); return false; }
+            if (is_mxfp4(M, name)) {
+                fprintf(stderr, "load_layer: %s unexpectedly has a _scale (MXFP4)\n", name.c_str());
+                return false;
+            }
+            if (t->dtype != "BF16") {
+                fprintf(stderr, "load_layer: %s dtype %s, expected BF16\n",
+                        name.c_str(), t->dtype.c_str());
+                return false;
+            }
+            const size_t n_elems = (size_t)IH * H;
+            if (t->nbytes != n_elems * sizeof(uint16_t)) {
+                fprintf(stderr, "load_layer: %s has %llu bytes, expected %zu (bf16)\n",
+                        name.c_str(), (unsigned long long)t->nbytes, n_elems * sizeof(uint16_t));
+                return false;
+            }
+            std::vector<uint8_t> raw;
+            if (!st::read_bytes(M, name, raw)) return false;
+            std::vector<float> f32(n_elems);
+            const uint16_t* src = reinterpret_cast<const uint16_t*>(raw.data());
+            for (size_t i = 0; i < n_elems; i++) f32[i] = st::bf16_to_f32(src[i]);
+            GLM_CUDA_OK(cudaMalloc(&out->idx_weights_proj, n_elems * sizeof(float)));
+            GLM_CUDA_OK(cudaMemcpy(out->idx_weights_proj, f32.data(),
+                                   n_elems * sizeof(float), cudaMemcpyHostToDevice));
+        }
+    }
 
     if (layer >= c.dense_first) {
         BF16("mlp.gate.weight", router_w, (size_t)c.n_routed_experts * H);
