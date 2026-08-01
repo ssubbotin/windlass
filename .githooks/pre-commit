@@ -1,0 +1,18 @@
+#!/bin/sh
+# Reject commits authored with anything other than the project identity.
+# The global git config on this machine is a work address; this repo is a
+# personal MIT project whose LICENSE names ssubbotin@gmail.com, so a mismatch
+# between the commit log and the copyright holder is a real defect.
+WANT_EMAIL="ssubbotin@gmail.com"
+WANT_NAME="Sergey Subbotin"
+
+EMAIL=$(git var GIT_AUTHOR_IDENT | sed -n 's/.*<\(.*\)>.*/\1/p')
+NAME=$(git var GIT_AUTHOR_IDENT | sed -n 's/^\(.*\) <.*/\1/p')
+
+if [ "$EMAIL" != "$WANT_EMAIL" ] || [ "$NAME" != "$WANT_NAME" ]; then
+  echo "pre-commit: refusing to commit as '$NAME <$EMAIL>'" >&2
+  echo "            this repo requires '$WANT_NAME <$WANT_EMAIL>' (see LICENSE)" >&2
+  echo "            fix with: git config user.name  \"$WANT_NAME\"" >&2
+  echo "                      git config user.email \"$WANT_EMAIL\"" >&2
+  exit 1
+fi
