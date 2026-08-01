@@ -343,6 +343,60 @@ indices, and the `T = 13000` regime.
 
 ---
 
+### Task 4b: Amortise expert fetches across prefill positions
+
+**Ruling (human, 2026-08-01):** inserted before Task 5 so the remaining long-context
+correctness work is tractable rather than an endurance exercise.
+
+Task 4 measured prefill at **~0.25 tok/s cold**, NVMe-bound at 2.2 GB/s — *slower per
+token than decode's 1.227*, which is backwards. The cause is in `run_chain`: the loop is
+position-major.
+
+```c
+for (i = 0; i < n_tokens; i++)          // positions
+    for (l = 0; l < c.n_layers; l++)    // layers
+        run_layer(..., pos, ...)        // fetches this position's 8 experts
+```
+
+Every position independently walks all 78 layers and fetches its own experts. A
+1400-token prompt costs **1400 x 75 x 8 = 840,000 expert fetches** against a cache
+holding 15.9% of the set, so it thrashes.
+
+Inverting the loops for prefill lets each layer route **all** positions at once, collect
+the unique experts — at most 256, since that is all a layer has — fetch each **once**,
+and apply it to every position routed to it. That is **<=19,200 fetches, 44x fewer**, and
+it is the standard batched-prefill optimisation (Colibri: "batched positions read each
+unique expert once"). At 2.2 GB/s, reading the expert set once per prefill is ~3 minutes
+rather than ~90.
+
+**Design constraints:**
+
+- **Decode must be untouched.** At `n_tokens == 1` both forms are identical; keep that
+  true by construction rather than by a parallel code path that can drift.
+- **Attention stays causal.** Within a layer, compute every position's K/V first (they do
+  not depend on attention output), then each position's attention over the KV built so
+  far. Position `i` must see exactly positions `0..i`, as now.
+- **IndexShare semantics are unchanged.** A leader layer computes indices for all
+  positions; members reuse them for all positions. Same propagation, different loop order.
+- **Scratch sizing.** Do not naively multiply every scratch buffer by `n_tokens`.
+  Hidden states for all positions are 34 MB at 1400 tokens; per-expert work should be
+  batched over the positions routed to that expert (~44 for a 1400-token prompt), not
+  over all of them. State the sizes you chose and why.
+
+**Acceptance:**
+
+- [ ] `test_glm_chain` still reports **worst substep 1.6928e-06 and top-5 exact**. This is
+  the gate that proves a loop restructure preserved the numerics; it has been stable
+  across five tasks and three consecutive runs.
+- [ ] Prefill measured **before and after on the identical prompt**, both figures reported.
+  A speedup claimed against a remembered number is not a measurement.
+- [ ] Decode throughput unchanged within noise — report it, since a regression there
+  would mean the shared path drifted.
+- [ ] Expert-fetch count instrumented per prefill, before and after, to confirm the
+  reduction is real rather than inferred from wall-clock.
+
+---
+
 ### Task 5: Long-context single-layer oracle
 
 **Files:** `tools/dump_glm_oracle.py`, `src/test_glm_layer.cu`
