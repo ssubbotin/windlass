@@ -407,9 +407,40 @@ See `.superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-4b-report.md`.
 
 **Files:** `tools/dump_glm_oracle.py`, `src/test_glm_layer.cu`
 
-- [ ] Dump layer 2 (an indexer owner) and layer 3 (a consumer) at `--seq 4096`.
-- [ ] Compare CUDA against it. Derive the tolerance from measured baseline as Task 10 did; do not import the ≤2048 figure.
-- [ ] Negative controls: perturb the top-k selection, the head combination, and the k_norm eps. Each must be caught, with separation reported.
+**DONE** — 2026-08-02.
+
+- [x] Dump layer 2 (an indexer owner) and layer 3 (a consumer) at `--seq 4096`.
+- [x] Compare CUDA against it. Tolerance re-derived at 4096; the ≤2048 figure is not imported.
+- [x] Negative controls: top-k selection, head combination, `k_norm` eps. Two of the three separate; the eps does not, and that is reported as a measured limitation rather than chased with a tighter gate.
+
+**Outcome.** The layer arithmetic matches transformers at 4096 to the bf16 fixture floor
+(**0.83 ulp** layer 2 / **0.59 ulp** layer 3, worst substep, with the oracle's key selection forced
+in). With the CUDA indexer choosing its own keys the worst substep is **6.85 / 10.05 ulp**, and all
+of that excess is the selection: the two implementations agree on **2043 of 2048** keys, and the
+five that differ are within 2e-4 of the selection boundary — inside the measured 5.34e-03
+index-score noise floor. Gates: **3.0 ulp** on the forced-selection pass, **20.0 ulp** on the native
+pass (2x the worst measured), **2.0e-02** relative on the index-score row (3.7x over its measured
+5.34e-03 floor). Below `index_topk` the loose gate does not apply — there is no selection difference
+to allow for there.
+
+Three corrections to earlier tasks' expectations, all measured:
+
+1. **The tie tail Task 1 predicted does not exist at the combined level.** 54.7% of the per-head
+   relu'd scores are exactly 0.0, but **0 of 4096** combined index scores are — the head weights
+   have mixed signs, so the sum is almost never exactly zero. The selection is therefore
+   well-determined and index-set agreement is 99.76%, not the near-arbitrary tail that was feared.
+2. **The bf16 key cache is only half the index-score floor.** Task 3 attributed it to the cache
+   alone. Perturbing the oracle's own `q` and `k` by half a bf16 ulp reproduces 2.50e-03 and
+   2.39e-03 respectively (3.81e-03 together) against a measured 5.34e-03: transformers keeps the
+   indexer's **q** in bf16 too (`wq_b` is a bf16 Linear) while this path keeps it fp32, and that
+   term is as large as the cache's.
+3. **The eps trap is far bigger on real weights than Task 3's fixture suggested — and still
+   invisible.** Task 3 measured 2.51e-06 at scale 1.0; here the same 1e-6→1e-5 injection moves the
+   index score by **2.26e-03**, ~1000x more, because `var(wk(x))` is small on real weights. It is
+   still not separable, because that is the same size as each bf16 term above. Matching q's dtype
+   would not fix it.
+
+See `.superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-5-report.md`.
 
 ---
 

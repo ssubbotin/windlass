@@ -207,7 +207,13 @@ __global__ void rope_interleave_slice(
 // and deleted the copy — there is exactly one rotation in the repo now.
 
 // LayerNorm eps for indexer.k_norm — M:199, a literal, NOT Config::rms_eps.
-static const float INDEXER_LN_EPS = 1e-6f;
+// Overridable at build time ONLY so that Task 5's negative control can inject
+// the wrong value (-DGLM_INDEXER_LN_EPS=1e-5f) without editing this file. No
+// shipped build ever sets it; the default is the value M:199 hardcodes.
+#ifndef GLM_INDEXER_LN_EPS
+#define GLM_INDEXER_LN_EPS 1e-6f
+#endif
+static const float INDEXER_LN_EPS = GLM_INDEXER_LN_EPS;
 
 // Round-to-nearest-even f32 -> bf16, matching torch's cast. The indexer KV
 // cache stores bf16 (M:244-245 keeps k in its own dtype), so this rounding is
