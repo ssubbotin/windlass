@@ -2,7 +2,7 @@
 
 **Run mixture-of-experts language models larger than your GPU, with routed experts streamed from NVMe.**
 
-A single-GPU CUDA inference engine for MoE models whose weights do not fit in VRAM. Dense weights stay resident on the card; routed experts live on an SSD and are hauled up on demand through an LRU cache in VRAM. Pure C/CUDA, no framework dependencies.
+A single-GPU CUDA inference engine for MoE models whose weights do not fit in VRAM. Dense weights stay resident on the card; routed experts live on an SSD and are hauled up on demand through an LRU cache in VRAM. CUDA C++, no framework dependencies.
 
 Currently runs **GLM-5.2** (753B total / 39B active, MXFP4) on a single 96 GB card:
 
