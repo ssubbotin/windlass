@@ -15,11 +15,19 @@ There is no sequence-length cap. The DSA indexer is implemented (see IndexShare
 and indexer_scores), so `seq > index_topk` is a real sparse forward here as it is
 in transformers -- not an abort, and not a dense forward wearing a sparse label.
 
+Prefill is LAYER-major (`prefill_layer_major`): per layer, every position's
+attention and routing run first, then each routed expert is read once and applied
+to all the positions that want it. Nothing is batched into a matmul, so the
+result is bit-identical to the position-major loop `--prefill position` still
+provides. Decode is one position and therefore has no loop order to invert; it
+runs through the same `layer_forward` either way.
+
 Citations below are `modeling_glm_moe_dsa.py:LINE` (`M:`) and
 `configuration_glm_moe_dsa.py:LINE` (`C:`), transformers 5.14.1.
 
 Usage:
   ref_glm_chain.py --model DIR --packed DIR --prompt-ids 1,2,3 --tokens 5 --out DIR
+  ref_glm_chain.py ... --prefill position --weight-cache off   # the pre-6b cost
   ref_glm_chain.py --model DIR --packed DIR --inject-hidden X.npy --inject-layer 3 \
       --inject-only --out DIR
 """
@@ -343,6 +351,41 @@ def load_layer_weights(store, cfg, layer):
     return W
 
 
+class LayerWeights:
+    """Per-layer non-expert weights, optionally kept in host RAM.
+
+    The chain driver used to call `load_layer_weights` once per layer PER
+    POSITION, so a prompt of n tokens restreamed and re-widened the model's
+    whole non-expert half n times. At the 29-token fixture that is tolerable; at
+    Task 7's ~1400 it is the dominant cost of a ~45-hour run.
+
+    The weights are the same object every time, not a copy, so nothing about the
+    arithmetic changes -- `load_layer_weights` is a pure function of the
+    checkpoint. `enabled=False` restores the old behaviour verbatim and exists so
+    the before/after measurement can be taken from one script.
+
+    `load_layer_weights` is looked up on the module at call time, so
+    check_ref_vs_oracle.py's negative-control monkeypatching still reaches it.
+    """
+
+    def __init__(self, store, cfg, enabled=True):
+        self.store, self.cfg, self.enabled = store, cfg, enabled
+        self._w = {}
+        self.loads = 0
+
+    def get(self, layer):
+        if not self.enabled:
+            self.loads += 1
+            return load_layer_weights(self.store, self.cfg, layer)
+        if layer not in self._w:
+            self.loads += 1
+            self._w[layer] = load_layer_weights(self.store, self.cfg, layer)
+        return self._w[layer]
+
+    def nbytes(self):
+        return sum(sum(t.nbytes for t in W.values()) for W in self._w.values())
+
+
 # ---------------------------------------------------------------------------
 # Packed routed experts
 # ---------------------------------------------------------------------------
@@ -353,6 +396,11 @@ def load_layer_weights(store, cfg, layer):
 # EXPERT_BYTES = 20054016.
 
 _PACK_FH = {}
+
+# Every read_expert call, counted. Wall clock alone cannot tell "read less" from
+# "got luckier with the page cache" -- this host has 125 GB of RAM against a
+# 359 GB expert set, so cache state moves between runs. The count does not.
+EXPERT_READS = {"n": 0, "bytes": 0}
 
 
 def _packed_handle(packed, layer):
@@ -376,6 +424,8 @@ def read_expert(packed, layer, e, cfg):
     fh = _packed_handle(packed, layer)
     fh.seek(e * stride)
     blob = np.frombuffer(fh.read(stride), dtype=np.uint8)
+    EXPERT_READS["n"] += 1
+    EXPERT_READS["bytes"] += stride
     outs, off = [], 0
     for (r, c), n in zip(sizes, nb):
         outs.append(blob[off:off + n].reshape(r, c))
@@ -493,36 +543,28 @@ TAPS = ["post_input_norm", "attn_out", "post_attn_hidden", "post_post_norm",
         "indexer_q", "indexer_w", "indexer_index_score", "indexer_topk"]
 
 
-def layer_forward(h, W, cfg, pos, cos, sin, cache, packed, layer, taps=None,
-                  share=None, force_topk=None):
-    """One decoder layer for ONE token at absolute position `pos`.
-
-    h: [hidden] float32. cache: dict with 'k' [T, n_heads, qk_head] and
-    'v' [T, n_heads, v_head] float32 -- the materialized form transformers itself
-    caches (M:402-403). Pre-norm block of M:602-620, attention from M:381-453.
-
-    `taps`, if a dict, is filled with the intermediate tensors named in TAPS.
-    The final residual add is NOT sensitive enough to validate this layer on its
-    own -- it is dominated by the incoming hidden state, so a wrong router bias
-    or a wrong routed_scaling_factor moves the layer OUTPUT by well under the
-    comparison tolerance while moving `moe_out` by an order of magnitude more.
-    Comparing the taps against the oracle's per-substep dumps is what actually
-    pins the layer down.
-
-    `share` is the IndexShare threaded through the layer loop (M:715-724). A
-    "full" layer publishes into it; a "shared" layer consumes it and raises if it
-    is empty, exactly as M:418 does. `force_topk`, if given, replaces the
-    selection used for the mask WITHOUT suppressing the indexer -- the
-    index-score taps stay real. It is the analogue of test_glm_layer's
-    --force-oracle-topk and exists to separate "the arithmetic is wrong" from
-    "the two implementations picked slightly different keys".
-    """
-    HN, NP, RP, VD = cfg["n_heads"], cfg["qk_nope"], cfg["qk_rope"], cfg["v_head"]
-    DH, L, eps = NP + RP, cfg["kv_lora"], cfg["rms_eps"]
-
+def _tapper(taps):
+    """Wrap a taps dict (or None) as the `tap(name, value)` callable the layer
+    pieces below take. One helper so the three pieces cannot disagree about what
+    "no taps requested" means."""
     def tap(name, val):
         if taps is not None:
             taps[name] = np.asarray(val)
+    return tap
+
+
+def attn_block(h, W, cfg, pos, cos, sin, cache, layer, tap,
+               share=None, force_topk=None):
+    """input_layernorm through o_proj and the first residual add, ONE position.
+
+    Split out of layer_forward so the layer-major prefill can run this for every
+    position before any expert is read. It is a move between functions, not a
+    rewrite: the statements below are layer_forward's, in layer_forward's order,
+    and layer_forward still calls this. There is exactly one copy of the
+    arithmetic, so decode cannot drift from prefill.
+    """
+    HN, NP, RP, VD = cfg["n_heads"], cfg["qk_nope"], cfg["qk_rope"], cfg["v_head"]
+    DH, L, eps = NP + RP, cfg["kv_lora"], cfg["rms_eps"]
 
     resid = h
     x = rms_norm(h, W["input_layernorm"], eps)                             # M:603
@@ -598,25 +640,66 @@ def layer_forward(h, W, cfg, pos, cos, sin, cache, packed, layer, taps=None,
     tap("attn_out", attn_out)
     h = resid + attn_out                                                   # M:615
     tap("post_attn_hidden", h)
+    return h
 
-    # --- MLP / MoE ---------------------------------------------------------
+
+def moe_prepare(h, W, cfg, layer, tap):
+    """post_attention_layernorm + routing, ONE position. Returns
+    (resid, xn, idx, wt); idx/wt are None on a dense layer.
+
+    Nothing here reads an expert, which is the point: the layer-major prefill
+    runs this for every position and only then knows the layer's whole routed
+    set, so each expert can be read once.
+    """
     resid = h
-    xn = rms_norm(h, W["post_attention_layernorm"], eps)                   # M:618
+    xn = rms_norm(h, W["post_attention_layernorm"], cfg["rms_eps"])        # M:618
     tap("post_post_norm", xn)
     if layer < cfg["dense_first"]:
+        return resid, xn, None, None
+    logits, idx, wt = route(xn, W["gate.weight"], W["gate.e_score_correction_bias"],
+                            cfg["top_k"], cfg["routed_scaling"], cfg["norm_topk_prob"])
+    tap("router_logits", logits)
+    tap("topk_idx", idx)
+    tap("topk_w", wt)
+    return resid, xn, idx, wt
+
+
+def dequant_expert(blocks):
+    """The three fp32 matrices of one routed expert, from read_expert's blocks.
+
+    Hoisted out of the per-slot loop so the layer-major path dequantizes each
+    expert ONCE and reuses it for every position routed to it. `dequant` is a
+    pure function of the packed bytes, so the matrices are bit-identical to the
+    ones the position-major loop rebuilt per position.
+    """
+    gw, gs, uw, us, dw, ds = blocks
+    return dequant(gw, gs), dequant(uw, us), dequant(dw, ds)
+
+
+def expert_slot(xn, G, U, D):
+    """One routed expert applied to one position, M:538-548, WITHOUT the top-k
+    weight -- the caller multiplies and accumulates, so summation order stays
+    with the caller."""
+    g = xn @ G.T
+    u = xn @ U.T
+    return (silu(g) * u) @ D.T
+
+
+def moe_finish(resid, xn, W, cfg, layer, idx, wt, slot_outs, tap):
+    """The MLP/MoE combination and the second residual, ONE position.
+
+    `slot_outs[k]` is expert_slot's output for routed slot k, in ROUTING order.
+    The accumulation below is the original `y = 0; y += w_k e_k for k in 0..7;
+    y = y + shared` -- float addition is not associative, so the order the slots
+    are summed in is load-bearing and is deliberately NOT the order the experts
+    were read in.
+    """
+    if idx is None:
         y = (silu(xn @ W["gate_proj"].T) * (xn @ W["up_proj"].T)) @ W["down_proj"].T   # M:468
     else:
-        logits, idx, wt = route(xn, W["gate.weight"], W["gate.e_score_correction_bias"],
-                                cfg["top_k"], cfg["routed_scaling"], cfg["norm_topk_prob"])
-        tap("router_logits", logits)
-        tap("topk_idx", idx)
-        tap("topk_w", wt)
         y = np.zeros(cfg["hidden"], np.float32)
-        for e, a in zip(idx, wt):                                          # M:538-548
-            gw, gs, uw, us, dw, ds = read_expert(packed, layer, int(e), cfg)
-            g = xn @ dequant(gw, gs).T
-            u = xn @ dequant(uw, us).T
-            y += a * ((silu(g) * u) @ dequant(dw, ds).T)
+        for a, so in zip(wt, slot_outs):                                   # M:538-548
+            y += a * so
         # shared expert: SAME normalized input, added AFTER the routed sum, and
         # NOT multiplied by routed_scaling_factor (M:567-573)
         shared = (silu(xn @ W["sh_gate"].T) * (xn @ W["sh_up"].T)) @ W["sh_down"].T
@@ -625,6 +708,41 @@ def layer_forward(h, W, cfg, pos, cos, sin, cache, packed, layer, taps=None,
     tap("moe_out", y)
     out = resid + y                                                        # M:620
     tap("output_hidden", out)
+    return out
+
+
+def layer_forward(h, W, cfg, pos, cos, sin, cache, packed, layer, taps=None,
+                  share=None, force_topk=None):
+    """One decoder layer for ONE token at absolute position `pos`.
+
+    h: [hidden] float32. cache: dict with 'k' [T, n_heads, qk_head] and
+    'v' [T, n_heads, v_head] float32 -- the materialized form transformers itself
+    caches (M:402-403). Pre-norm block of M:602-620, attention from M:381-453.
+
+    `taps`, if a dict, is filled with the intermediate tensors named in TAPS.
+    The final residual add is NOT sensitive enough to validate this layer on its
+    own -- it is dominated by the incoming hidden state, so a wrong router bias
+    or a wrong routed_scaling_factor moves the layer OUTPUT by well under the
+    comparison tolerance while moving `moe_out` by an order of magnitude more.
+    Comparing the taps against the oracle's per-substep dumps is what actually
+    pins the layer down.
+
+    `share` is the IndexShare threaded through the layer loop (M:715-724). A
+    "full" layer publishes into it; a "shared" layer consumes it and raises if it
+    is empty, exactly as M:418 does. `force_topk`, if given, replaces the
+    selection used for the mask WITHOUT suppressing the indexer -- the
+    index-score taps stay real. It is the analogue of test_glm_layer's
+    --force-oracle-topk and exists to separate "the arithmetic is wrong" from
+    "the two implementations picked slightly different keys".
+    """
+    tap = _tapper(taps)
+    h = attn_block(h, W, cfg, pos, cos, sin, cache, layer, tap, share, force_topk)
+    resid, xn, idx, wt = moe_prepare(h, W, cfg, layer, tap)
+    slot_outs = None
+    if idx is not None:
+        slot_outs = [expert_slot(xn, *dequant_expert(read_expert(packed, layer, int(e), cfg)))
+                     for e in idx]
+    out = moe_finish(resid, xn, W, cfg, layer, idx, wt, slot_outs, tap)
     return out, cache
 
 
@@ -666,6 +784,88 @@ def prefill_kv(X, W, cfg, cos, sin, layer, cache=None, pos0=0, chunk=256):
         if owner:
             cache["ik"].extend(indexer_keys(x, W, cfg, pos, cos, sin))
     return cache
+
+
+def prefill_layer_major(H, cfg, weights, packed, cos, sin, caches, shares,
+                        taps_for=None, after_layer=None, pos0=0, progress=None):
+    """Run every layer over a block of positions, LAYER-major.
+
+    The position-major driver's loop is `for pos: for layer:`; this is
+    `for layer: for pos:`. Same work, different order, and the order is what
+    costs: per layer the non-expert weights are fetched once instead of once per
+    position, and every routed expert is read ONCE instead of once per position
+    that wants it (a layer has only 256 experts, so that is the ceiling however
+    long the prompt is).
+
+    NOTHING IS BATCHED INTO A MATMUL. Every expression below is still evaluated
+    one position at a time, with the same shapes the position-major loop used,
+    because a batched `X @ A.T` does not accumulate in the same order as a loop
+    of `x @ A.T` -- measured here at ~1.4e-04 absolute on a 6144-deep reduction,
+    which would put the before/after comparison into tolerance territory instead
+    of bit-identity. Reordering *when* positions are computed changes nothing;
+    reassociating a sum changes the answer.
+
+    H: [n, hidden] float32, the embedded prompt. Updated IN PLACE, so on return
+       H[i] is position i's hidden state after the last layer.
+    caches: {layer: {"k": [], "v": [], "ik": []}}, filled ascending in position
+       as before -- position i appends its own K/V and then attends over 0..i, so
+       causality is still the loop bound.
+    shares: one IndexShare PER POSITION. M:715 resets `prev_topk_indices` per
+       forward, and a forward is a position; layer-major just means n of them are
+       alive at once instead of one at a time. Leaders publish into shares[i],
+       members read shares[i], and a member with nothing published still raises.
+    taps_for(layer, i) -> dict or None; after_layer(layer, H) runs once a layer
+       has finished every position.
+    """
+    n = H.shape[0]
+    n_layers = cfg["n_layers"]
+    for layer in range(n_layers):
+        t0 = time.time()
+        W = weights.get(layer)
+        cache = caches[layer]
+        taps = [taps_for(layer, i) if taps_for else None for i in range(n)]
+
+        # pass 1 -- attention, ascending position.
+        post_attn = [None] * n
+        for i in range(n):
+            post_attn[i] = attn_block(H[i], W, cfg, pos0 + i, cos, sin, cache,
+                                      layer, _tapper(taps[i]), shares[i])
+
+        # pass 2 -- post-attention norm and routing, every position. No expert is
+        # read here, so by the end the layer's whole routed set is known.
+        prep = [moe_prepare(post_attn[i], W, cfg, layer, _tapper(taps[i]))
+                for i in range(n)]
+        del post_attn
+
+        # pass 3 -- experts, EXPERT-major: each unique expert read and
+        # dequantized once, then applied to every position routed to it.
+        slot_outs = [None] * n
+        n_unique = 0
+        if layer >= cfg["dense_first"]:
+            routed = {}
+            for i in range(n):
+                slot_outs[i] = [None] * cfg["top_k"]
+                for k, e in enumerate(prep[i][2]):
+                    routed.setdefault(int(e), []).append((i, k))
+            n_unique = len(routed)
+            for e in sorted(routed):
+                G, U, D = dequant_expert(read_expert(packed, layer, e, cfg))
+                for i, k in routed[e]:
+                    slot_outs[i][k] = expert_slot(prep[i][1], G, U, D)
+                del G, U, D
+
+        # pass 4 -- combine, in ROUTING-slot order, and the second residual.
+        for i in range(n):
+            resid, xn, idx, wt = prep[i]
+            H[i] = moe_finish(resid, xn, W, cfg, layer, idx, wt, slot_outs[i],
+                              _tapper(taps[i]))
+        del prep, slot_outs
+
+        if after_layer:
+            after_layer(layer, H)
+        if progress:
+            progress(layer, time.time() - t0, n_unique)
+    return H
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +933,19 @@ def main():
                          "--dump-layer. Task 10 gates per substep, not on the hidden state "
                          "alone -- a layer output is residual-dominated and hides MoE-side "
                          "error (see task-9-report.md section 4).")
+    ap.add_argument("--prefill", choices=("layer", "position"), default="layer",
+                    help="prompt loop order. 'layer' reads each layer's weights and "
+                         "each routed expert once per PROMPT; 'position' is the "
+                         "original once-per-POSITION loop, kept so the before/after "
+                         "measurement comes out of one script. Decode is the same "
+                         "code either way -- a single position has no loop to invert.")
+    ap.add_argument("--weight-cache", choices=("on", "off"), default=None,
+                    help="keep the non-expert layer weights in host RAM (~44 GB for "
+                         "all 78 layers). Default: on with --prefill layer, off with "
+                         "--prefill position, so 'position' reproduces the pre-6b cost.")
     args = ap.parse_args()
+    if args.weight_cache is None:
+        args.weight_cache = "on" if args.prefill == "layer" else "off"
     if args.inject_hidden and not args.inject_only:
         # --inject-hidden without --inject-only used to run layers L0..77 for every
         # position and then discard the result: the only np.save on this path is
@@ -814,44 +1026,96 @@ def main():
 
     dump_layers = set(args.dump_layer if args.dump_layer else [0, 3, 40, 77])
     n_layers = cfg["n_layers"]      # 78; layer 78 is the MTP head, out of scope
-    total = len(ids) + args.tokens
+    n_prompt = len(ids)
+    total = n_prompt + args.tokens
     cos, sin = rope_tables(total + 8, cfg["rot"], cfg["rope_theta"])
     caches = {l: {"k": [], "v": [], "ik": []} for l in range(n_layers)}
     final_norm = store.raw("model.norm.weight")
+    weights = LayerWeights(store, cfg, enabled=(args.weight_cache == "on"))
+    n_moe = n_layers - cfg["dense_first"]
 
-    pos = 0
-    tok = ids[0]
+    def save_taps(layer, taps):
+        for name, val in taps.items():
+            np.save(os.path.join(args.out,
+                                 f"ref_chain_{name}_L{layer}_t0.npy"), val)
+
+    def save_hidden(layer, h):
+        np.save(os.path.join(args.out, f"ref_chain_hidden_L{layer}_t0.npy"),
+                h.astype(np.float32))
+
+    # -- prefill: consume the prompt. t=0 is the step that consumes the LAST
+    #    prompt token and emits the first generated token, so that is where the
+    #    fixtures are taken -- in either loop order.
+    print(f"prefill: {n_prompt} positions, mode={args.prefill}, "
+          f"weight-cache={args.weight_cache}", flush=True)
+    t_pre, reads0 = time.time(), EXPERT_READS["n"]
+    if args.prefill == "layer" and n_prompt > 1:
+        H = np.stack([embed_row(store, t) for t in ids]).astype(np.float32)
+        # One IndexShare per position (M:715 resets it per forward); layer-major
+        # only means n of them are alive at once.
+        shares = [IndexShare() for _ in range(n_prompt)]
+        tap_dicts = {}
+
+        def taps_for(layer, i):
+            if not (args.dump_substeps and layer in dump_layers
+                    and i == n_prompt - 1):
+                return None
+            tap_dicts[layer] = {}
+            return tap_dicts[layer]
+
+        def after_layer(layer, Hs):
+            if layer in dump_layers:
+                save_taps(layer, tap_dicts.pop(layer, {}))
+                save_hidden(layer, Hs[-1])
+
+        def progress(layer, dt, n_unique):
+            print(f"  layer {layer}: {dt:.1f}s  unique experts {n_unique}  "
+                  f"reads so far {EXPERT_READS['n'] - reads0}  "
+                  f"RSS={peak_rss_gb():.2f} GB", flush=True)
+
+        prefill_layer_major(H, cfg, weights, args.packed, cos, sin, caches, shares,
+                            taps_for, after_layer, 0, progress)
+        h = H[-1]
+        del H
+    else:
+        for p in range(n_prompt):
+            t0 = time.time()
+            h = embed_row(store, ids[p])
+            # M:715 -- topk_indices starts as None on every forward, so a "shared"
+            # layer can only ever see a leader's selection from THIS position.
+            share = IndexShare()
+            at_t0 = p == n_prompt - 1
+            for layer in range(n_layers):
+                W = weights.get(layer)
+                taps = {} if (args.dump_substeps and at_t0
+                              and layer in dump_layers) else None
+                h, caches[layer] = layer_forward(h, W, cfg, p, cos, sin,
+                                                 caches[layer], args.packed, layer,
+                                                 taps, share)
+                if taps:
+                    save_taps(layer, taps)
+                if layer in dump_layers and at_t0:
+                    save_hidden(layer, h)
+                del W
+            print(f"prompt pos {p}: {time.time() - t0:.1f}s", flush=True)
+    pre_s, pre_reads = time.time() - t_pre, EXPERT_READS["n"] - reads0
+    print(f"[prefill] mode={args.prefill} weight-cache={args.weight_cache} "
+          f"tokens={n_prompt} | {pre_s:.1f}s | {n_prompt / pre_s:.3f} tok/s | "
+          f"expert reads {pre_reads} "
+          f"({pre_reads / n_prompt:.1f} per position, "
+          f"{pre_reads / max(n_moe, 1):.1f} per MoE layer, ceiling 256) | "
+          f"weight loads {weights.loads} | "
+          f"cached weights {weights.nbytes() / 2**30:.1f} GB | "
+          f"RSS={peak_rss_gb():.2f} GB", flush=True)
+
+    # -- decode: one position at a time, through the SAME layer_forward the
+    #    position-major prefill uses. There is no separate decode arithmetic to
+    #    drift, and at one position the two loop orders are the same loop.
+    pos = n_prompt - 1
     generated = 0
+    dec_s, dec_reads = 0.0, 0
     while True:
         t0 = time.time()
-        h = embed_row(store, tok)
-        # M:715 -- topk_indices starts as None on every forward, so a "shared"
-        # layer can only ever see a leader's selection from THIS position.
-        share = IndexShare()
-        for layer in range(n_layers):
-            W = load_layer_weights(store, cfg, layer)          # streams, then drops
-            # t=0 is the step that consumes the LAST prompt token and emits the
-            # first generated token, so that is where the fixtures are taken.
-            at_t0 = generated == 0 and pos == len(ids) - 1
-            taps = {} if (args.dump_substeps and at_t0 and layer in dump_layers) else None
-            h, caches[layer] = layer_forward(h, W, cfg, pos, cos, sin,
-                                             caches[layer], args.packed, layer,
-                                             taps, share)
-            if taps:
-                for name, val in taps.items():
-                    np.save(os.path.join(args.out,
-                                         f"ref_chain_{name}_L{layer}_t0.npy"), val)
-            if layer in dump_layers and at_t0:
-                np.save(os.path.join(args.out, f"ref_chain_hidden_L{layer}_t0.npy"),
-                        h.astype(np.float32))
-            del W
-        if pos < len(ids) - 1:
-            # still consuming the prompt; the logits here are not a generation step
-            pos += 1
-            tok = ids[pos]
-            print(f"prompt pos {pos - 1}: {time.time() - t0:.1f}s")
-            continue
-
         hn = rms_norm(h, final_norm, cfg["rms_eps"])           # M:728, model.norm
         logits = lm_head_chunked(store, hn, cfg["vocab"])      # M:794, [154880] float32
         topk = np.argsort(-logits)[:5].astype(np.int32)
@@ -862,10 +1126,27 @@ def main():
         generated += 1
         if generated >= args.tokens:
             break
-        tok = int(topk[0])
         pos += 1
+        t0, r0 = time.time(), EXPERT_READS["n"]
+        h = embed_row(store, int(topk[0]))
+        share = IndexShare()
+        for layer in range(n_layers):
+            W = weights.get(layer)
+            h, caches[layer] = layer_forward(h, W, cfg, pos, cos, sin,
+                                             caches[layer], args.packed, layer,
+                                             None, share)
+            del W
+        dec_s += time.time() - t0
+        dec_reads += EXPERT_READS["n"] - r0
+        print(f"decode pos {pos}: {time.time() - t0:.1f}s", flush=True)
+    if generated > 1:
+        print(f"[decode] {generated - 1} steps | {dec_s:.1f}s | "
+              f"{(generated - 1) / dec_s:.3f} tok/s | expert reads {dec_reads}",
+              flush=True)
 
-    print(f"peak RSS: {peak_rss_gb():.2f} GB   total {time.time() - t_start:.1f}s")
+    print(f"peak RSS: {peak_rss_gb():.2f} GB   total {time.time() - t_start:.1f}s   "
+          f"expert reads {EXPERT_READS['n']} "
+          f"({EXPERT_READS['bytes'] / 2**30:.1f} GiB)")
 
 
 if __name__ == "__main__":

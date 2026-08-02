@@ -519,7 +519,7 @@ This is the same disease Task 4b cured in CUDA, and it takes the same cure.
 
 **Acceptance:**
 
-- [ ] **Bit-identity, not tolerance.** Reordering loops changes *when* things are computed,
+- [x] **Bit-identity, not tolerance.** Reordering loops changes *when* things are computed,
   not *what* — each position's arithmetic is independent. Task 4b's CUDA gate held at
   exactly 1.6928e-06 for this reason. Expect the same here and assert it: the before/after
   chain run must be bit-identical across all shared tensors, as Task 6 already
@@ -527,9 +527,18 @@ This is the same disease Task 4b cured in CUDA, and it takes the same cure.
   than reordering per-position operations, summation order changes and bit-identity will
   break** — if that happens, say so, quantify it, and justify the trade rather than
   quietly switching to a tolerance.
-- [ ] `check_ref_vs_oracle.py` short path unchanged, figures identical.
-- [ ] Before/after timing on the identical prompt, with expert-read counts, in one session.
-- [ ] Peak RSS reported — the 33 GB weight cache is new and the host has 125 GB.
+- [x] `check_ref_vs_oracle.py` short path unchanged, figures identical.
+- [x] Before/after timing on the identical prompt, with expert-read counts, in one session.
+- [x] Peak RSS reported — the 33 GB weight cache is new and the host has 125 GB.
+
+**Done (2026-08-02).** Layer-major prefill (`prefill_layer_major`) plus a host-RAM cache
+of the non-expert layer weights. **934 of 934 shared tensors bit-identical** against the
+pre-6b script on the same prompt, in both `--prefill layer` and `--prefill position`;
+nothing was batched into a matmul. At 1400 tokens the prefill reads **19,200** experts
+(exactly 256 per MoE layer, the ceiling — every expert requested once) against 840,000
+by construction, and runs in ~2 h against the ~43 h the measured baseline extrapolates to.
+
+See `.superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-6b-report.md`.
 
 ---
 
