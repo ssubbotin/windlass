@@ -544,9 +544,29 @@ See `.superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-6b-report.md`.
 
 ### Task 7: Full chain at long context
 
-- [ ] Regenerate fixtures with a ~1400-token real prompt (a PR diff plus review instructions).
-- [ ] Per-substep gating at layers 0/2/3/40/77 — note **layer 2 is added** because it is an indexer owner.
-- [ ] Top-5 exact at all generated tokens.
+- [x] Regenerate fixtures with a ~1400-token real prompt (a PR diff plus review instructions).
+  **Task 6b's `/home/user1/t6b_1400/` reused as-is** — it is that prompt, at 2 h and 84 GB a
+  run. One new reference was generated at 256 tokens with all 78 layers dumped, to bisect the
+  disagreement below.
+- [x] Per-substep gating at layers 0/2/3/40/77 — note **layer 2 is added** because it is an indexer owner.
+- [x] Top-5 exact at all generated tokens. **At 1400 tokens the argmax and the top-5 SET are
+  exact and the ORDER is not** — ranks 2 and 3, 0.27 apart, swap. See below.
+
+**Done (2026-08-02).** Layers 0, 2 and 3 agree on every substep at **1.0e-05** (worst
+2.876e-06, `attn_out L3`), router top-8 exact at all four MoE layers, and the indexer's index
+score gated at **2.0e-02** (worst 6.256e-03) on both owning layers. Layers 40 and 77 disagree
+by **7.4e-02**, and that is **not a defect**: `--nc jitter` measured a **1e-07** perturbation
+of one element per position producing a **2.4e-02** change in the final logits, saturating (a
+1e-06 perturbation produces 1.7e-02), with the expert-fetch count moving 18,917 -> 18,915 —
+i.e. MoE router flips, of which a 1400-token prefill offers 105,000 chances. Ruled out first,
+each with a run: the expert cache's async path (`--io-threads 0` reproduces every digit), Task
+4b's layer-major prefill (`--prefill layer|position` give bit-identical logits at 256), and the
+float32-vs-float64 RoPE angle table (a real 3.78e-05 difference at pos 1399 that fixes
+`indexer_q` and moves layer 40 not at all). Deep layers are therefore **reported, not gated**
+(`--gate-depth`), on the same rule Tasks 5/6 applied to the index SET. Negative controls:
+`weights_proj` x 2 caught **only** by the index-score gate (617x, outputs bit-identical to
+baseline), one key fewer selected caught **only** by the output gate (392x). Short-context
+regression unmoved: `1.6928e-06`, top-5 exact at all 5 tokens.
 
 ---
 

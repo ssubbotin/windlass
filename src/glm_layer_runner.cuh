@@ -159,12 +159,36 @@ __device__ __forceinline__ float block_reduce_max(float v) {
 // host-side angle table stays here.
 
 // Host-side table for one position. rot = qk_rope_head_dim = 64, theta = 8e6.
+//
+// THE ANGLE IS COMPUTED IN FLOAT32 ON PURPOSE. transformers does the same
+// (GlmMoeDsaRotaryEmbedding builds inv_freq as float32 and multiplies by the
+// float32 position), so this table is bit-identical to the model's own, which
+// is what Task 5 measured at position 4095: attn_out 0.36 bf16 ulp against
+// transformers, far below the ~1e-4 two independently-rounded float32 tables
+// would differ by.
+//
+// It is NOT the most accurate way to compute cos(pos * inv). At pos = 1399 a
+// float64 angle and a float32 one differ by up to 3.78e-05 (4.77e-07 at pos 28
+// — the difference grows with position, so short-context fixtures never saw
+// it), and Task 7 measured that difference alone driving the 78-layer chain
+// 7.4e-02 apart at layer 40. GLM_ROPE_ANGLE_DOUBLE=1 builds the float64 form so
+// that experiment can be run; no shipped build sets it, because matching the
+// model matters more here than being closer to the real cosine.
+#ifndef GLM_ROPE_ANGLE_DOUBLE
+#define GLM_ROPE_ANGLE_DOUBLE 0
+#endif
 inline void rope_pos(float* cos_out, float* sin_out, uint32_t pos,
                      uint32_t rot, float theta) {
     for (uint32_t i = 0; i < rot / 2; i++) {
+#if GLM_ROPE_ANGLE_DOUBLE
+        const double inv = 1.0 / std::pow((double)theta, (double)(2 * i) / (double)rot);
+        cos_out[i] = (float)std::cos((double)pos * inv);
+        sin_out[i] = (float)std::sin((double)pos * inv);
+#else
         const float inv = 1.0f / std::pow(theta, (float)(2 * i) / (float)rot);
         cos_out[i] = std::cos((float)pos * inv);
         sin_out[i] = std::sin((float)pos * inv);
+#endif
     }
 }
 
