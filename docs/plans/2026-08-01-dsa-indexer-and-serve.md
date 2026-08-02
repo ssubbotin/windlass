@@ -488,6 +488,51 @@ See `.superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-6-report.md`.
 
 ---
 
+### Task 6b: Layer-major prefill in the numpy reference
+
+**Ruling (human, 2026-08-02):** take the full fix, not just weight caching.
+
+Task 6 found the chain driver **restreams 29 GB of non-expert weights per position**
+(`load_layer_weights` per layer per position), plus each position's own expert reads.
+Fine at the 29-token fixture, untenable at Task 7's ~1400 — extrapolating the earlier
+56-minute fixture run gives roughly **45 hours**.
+
+This is the same disease Task 4b cured in CUDA, and it takes the same cure.
+
+**Two independent problems, both to fix:**
+
+1. **Non-expert weights are re-read per position.** They total 33 GB against 125 GB of
+   host RAM. Cache them.
+2. **Expert reads are position-major.** Invert to layer-major as Task 4b did: per layer,
+   route all positions, collect the unique experts (at most 256), read each **once**, and
+   apply it to every position routed to it. Task 4b measured 840,000 fetches to 18,917 at
+   1400 tokens, with `cache hits = 0` — every expert requested exactly once.
+
+**Design constraints, mirroring Task 4b:**
+
+- **Decode is unchanged by construction.** At one position both loop orders are identical;
+  keep that true rather than maintaining a second path that can drift.
+- **Attention stays causal.** Within a layer compute all positions' K/V first, then each
+  position's attention over the KV built so far. Position `i` sees exactly `0..i`.
+- **IndexShare semantics unchanged.** Leaders publish for all positions, members consume
+  for all positions. Same propagation, different loop order.
+
+**Acceptance:**
+
+- [ ] **Bit-identity, not tolerance.** Reordering loops changes *when* things are computed,
+  not *what* — each position's arithmetic is independent. Task 4b's CUDA gate held at
+  exactly 1.6928e-06 for this reason. Expect the same here and assert it: the before/after
+  chain run must be bit-identical across all shared tensors, as Task 6 already
+  demonstrated for the indexer (848 of 848). **If you batch positions into matmuls rather
+  than reordering per-position operations, summation order changes and bit-identity will
+  break** — if that happens, say so, quantify it, and justify the trade rather than
+  quietly switching to a tolerance.
+- [ ] `check_ref_vs_oracle.py` short path unchanged, figures identical.
+- [ ] Before/after timing on the identical prompt, with expert-read counts, in one session.
+- [ ] Peak RSS reported — the 33 GB weight cache is new and the host has 125 GB.
+
+---
+
 ### Task 7: Full chain at long context
 
 - [ ] Regenerate fixtures with a ~1400-token real prompt (a PR diff plus review instructions).
