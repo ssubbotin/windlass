@@ -31,7 +31,7 @@ packed     /home/user1/packed_experts_glm   359 GiB, 75 layers, content-verified
 venv       /home/user1/glm-oracle-venv/bin/python3   transformers 5.14.1
 ```
 
-**`vllm-qwen36` is stopped and staying stopped** — the owner released the machine and will say when to switch Qwen3.6 back. While it is down the RLMKX PR bots have no model. Restore with `sudo systemctl start vllm-qwen36` (it is still `enabled`, so it also returns on reboot).
+**`vllm-qwen36` is running again and is in real use.** It was restarted 2026-08-02 20:36 UTC, shortly after this file was first written, and served 10,154 requests in the following week. It holds 92.5 GB of 97.9 GB, so windlass cannot run alongside it — its expert cache alone wants 61 GB. Stop it for a GPU window (`sudo systemctl stop vllm-qwen36`), restart immediately after, and confirm `/v1/models` on :8000 returns 200 before releasing. While it is down the RLMKX PR bots have no model, so ask before taking the window.
 
 **Expensive fixtures — do not delete:**
 
@@ -56,7 +56,7 @@ Two plans, both under `docs/plans/`, with SDD ledgers in `.superpowers/sdd/<plan
 | 4 IndexShare + mask · **4b layer-major prefill (CUDA)** | done |
 | 5 long-context oracle · 6 indexer in numpy ref · **6b layer-major (numpy)** | done |
 | 7 full chain at long context | done |
-| **8 prefill measurement** | largely answered by 4b — see below |
+| **8 prefill measurement** | done — decision point answered, build serve mode |
 | **9 serve mode** | next |
 | **10 PR review benchmark** | the goal |
 
@@ -66,13 +66,18 @@ Two plans, both under `docs/plans/`, with SDD ledgers in `.superpowers/sdd/<plan
 correctness   chain 1.6928e-06 worst substep, top-5 exact   (short context, stable across 7 tasks)
               single layers ≤2.2e-08 vs transformers oracle
               indexer forced-selection 0.2–0.4 ulp vs transformers at 4096
-throughput    decode  1.227 tok/s warm
+throughput    decode  1.227 tok/s warm (8 identical 60-token requests)
+                      0.637 tok/s on a real review (Task 8, unique 600-token completion)
               prefill 9.41 tok/s at 1400 tokens (148.8 s) after 4b
+                      9.39 tok/s at 1464 tokens (156.0 s), cold, Task 8 — reproduces 4b
 cache         56.5% hit rate at 16.1% residency (3,094 of 19,200 experts, 62 GB)
 expert reads  840,000 → 18,917 per 1400-token prefill; 252.2/layer vs a 256 ceiling
 ```
 
-A PR review is therefore roughly **13 minutes**: 149 s prefill + ~600 tokens at ~1 tok/s.
+A PR review measures **18 min 16 s** for 600 tokens: 156 s prefill + 940 s decode. The earlier
+13-minute estimate assumed ~1 tok/s decode; the real rate on a unique long generation is 0.637.
+A complete `--no-think` review is **21–26 minutes**. With thinking ON it is 52–94 minutes, because
+600 tokens of budget buy reasoning and no review at all.
 
 ## Findings that shape what comes next
 
@@ -88,9 +93,8 @@ A PR review is therefore roughly **13 minutes**: 149 s prefill + ~600 tokens at 
 
 ## Next steps
 
-1. **Task 8** — formally measure prefill on a realistic prompt. Largely answered by 4b (9.41 tok/s at 1400); run it for the record, cite the 4b report, not Task 4's stale 0.25 figure.
-2. **Task 9 — serve mode.** Port `--serve` from `~/flash-moe/cuda_infer/infer.cu:2579-3400` (OpenAI-compatible `/v1/chat/completions`, SSE, `/v1/models`, `/health`). Tool calling is not needed. Single in-flight request; 503 when busy; fail loudly if `prompt + max_tokens > max_seq`.
-3. **Task 10 — the PR review.** Add windlass to `~/boostrap-llm/bench_code_review.py`'s `MODELS`. Judge the review on quality and state the context and `max_tokens` used. Do **not** gate on token agreement.
+1. **Task 9 — serve mode.** Take `--serve` from the pattern in `~/flash-moe/cuda_infer/infer.cu:2579-3400` (OpenAI-compatible `/v1/chat/completions`, SSE, `/v1/models`, `/health`). That fork carries **no upstream licence**, so read it as a specification and write the code fresh, as every other file here was. Tool calling is not needed. Single in-flight request; 503 when busy; fail loudly if `prompt + max_tokens > max_seq`. **The SSE keepalive is load-bearing** — a request holds the connection past 20 minutes and any client without it times out before the first token.
+2. **Task 10 — the PR review.** Add windlass to `~/boostrap-llm/bench_code_review.py`'s `MODELS`. Run `--no-think`: with thinking on, the budget goes entirely to reasoning and no review is produced. State the context, `max_tokens`, and the no-think choice, since the other models run `max_tokens: 16384` unconstrained. Judge on quality; do **not** gate on token agreement.
 
 ## How to resume
 

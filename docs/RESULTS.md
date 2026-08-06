@@ -63,6 +63,20 @@ Eight identical requests in one process, 60 tokens each, warm:
 
 Baseline binary in the same window: **0.901 tok/s flat**. Honest speedup **1.36×**.
 
+### On a realistic workload the decode rate is 0.637 tok/s, not 1.227
+
+The 1.227 above is eight identical 60-token requests, which replay the same prompt and therefore recur over the same experts. One 600-token completion on a unique 1464-token prompt — the actual code-review workload — measures:
+
+```
+prefill  155.99 s   1464 tokens   9.39 tok/s   (seconds to first token)
+decode   939.79 s    599 steps    0.637 tok/s
+total   1095.78 s = 18 min 16 s
+```
+
+Prefill reproduces the layer-major figure to within 0.2%, from a **fully cold** cache (`hits=0 misses=18992`, 253.2 fetches per MoE layer against a 256 ceiling), so that amortisation does not depend on a warm pool. Decode is 1.93× lower than the headline. It is not a regression and not a cold-start transient: the per-interval hit rate falls from 60.1% and then plateaus around 44%, never trending upward, with the pool full for the entire run (3047/3047, 208,042 evictions against 211,089 misses, 15.9% residency). Decode fetches exactly 600 experts per step — 75 MoE layers × 8, one position, nothing to amortise. Attention rises from 1.5% to 8.8% of layer time at this context; expert fetch is still 84.2%.
+
+Quote 1.227 for the optimisation deltas it was measured against. Quote **0.637** for what a user waits through.
+
 ### Measurement discipline
 
 Page-cache state moves under you when the working set is 359 GB against 125 GB of RAM. The same binary measured **0.850 and 1.003 tok/s twenty minutes apart** — 18% drift, enough to invalidate a naive before/after pair. All deltas below come from an ABBA ordering with a closing baseline; a first pass was discarded when its closing baseline disagreed with its opening one.

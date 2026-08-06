@@ -572,10 +572,12 @@ regression unmoved: `1.6928e-06`, top-5 exact at all 5 tokens.
 
 ### Task 8: Measure prefill on a realistic prompt — decision point
 
-- [ ] Measure prefill separately from decode on the ~1400-token prompt, with `--timing`.
-- [ ] Report seconds-to-first-token and total time for a 600-token completion.
+- [x] Measure prefill separately from decode on the ~1400-token prompt, with `--timing`.
+- [x] Report seconds-to-first-token and total time for a 600-token completion.
 
 **This decides whether the serve mode is worth building.** If a review costs 8 minutes, windlass is usable for batch work; at 40 minutes it is a demonstration. Report the number before proceeding.
+
+**Answered: build it.** On the real `bench_code_review.py` prompt for `RLMKX/common#133` (1464 tokens), prefill is **155.99 s — 9.39 tok/s**, reproducing Task 4b within 0.2%, and 600 tokens decode in **939.79 s — 0.637 tok/s**, for **18 min 16 s** total. A complete `--no-think` review is ~21–26 min. Decode is 1.93× below the 1.227 tok/s in RESULTS.md because that figure is eight identical 60-token requests replaying the same experts; a unique long generation plateaus at 44.2% cache hit rate rather than 56.5%. Two constraints follow: 600 tokens with thinking ON yields **no review at all** (the budget goes entirely to reasoning), so Task 10 runs `--no-think` and discloses it; and a request occupies the connection for 20+ minutes, so Task 9's SSE keepalive is load-bearing rather than cosmetic.
 
 ---
 
