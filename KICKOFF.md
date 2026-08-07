@@ -1,6 +1,10 @@
 # windlass — session handoff
 
-Read this first when resuming. Written 2026-08-02.
+Read this first when resuming. Written 2026-08-02, updated 2026-08-07.
+
+> **Active work is on branch `task-9-serve-mode`, one commit ahead of this one.**
+> Serve mode is written and compiles but has never run on a GPU. Check that branch
+> out and read its KICKOFF before doing anything: `git checkout task-9-serve-mode`.
 
 ## Where we are in one paragraph
 
