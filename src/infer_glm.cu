@@ -33,9 +33,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <csignal>
 #include <ctime>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <vector>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -44,6 +48,7 @@
 
 #include <cuda_runtime.h>
 
+#include "glm_http.cuh"
 #include "safetensors_io.cuh"
 #include "glm_primitives.cuh"
 #include "glm_kernels.cuh"
@@ -174,6 +179,30 @@ static void tok_close(TokClient* tc) {
     if (tc->pid > 0) { int st; waitpid(tc->pid, &st, 0); tc->pid = -1; }
 }
 
+// ---------------------------------------------------------------------------
+// Serve state, shared by the accept loop and the one handler that holds the slot
+// ---------------------------------------------------------------------------
+struct ServeCtx {
+    glm::Config*                    c    = nullptr;
+    std::vector<glm::LayerWeights>* W    = nullptr;
+    glm::ChainWeights*              cw   = nullptr;
+    const glm::ExpertLayout*        lay  = nullptr;
+    glm::ExpertCache*               cache = nullptr;
+    struct TokClient*               tok  = nullptr;
+    float*                          d_logits = nullptr;
+    std::string                     model_name;
+    bool                            think = true;
+    uint32_t                        default_max_tokens = 600;
+
+    // One request at a time. The engine is a single GPU pipeline over one KV
+    // cache; a second concurrent generation would interleave writes to the same
+    // per-layer cache rows and silently corrupt both. The flag is what turns
+    // that into an honest 503 instead.
+    std::atomic<bool>     busy{false};
+    std::atomic<uint64_t> seq{0};
+    std::atomic<int>      open_conns{0};
+};
+
 static std::vector<int> parse_csv_ids(const std::string& s) {
     std::vector<int> out; size_t i = 0;
     while (i < s.size()) {
@@ -217,13 +246,277 @@ static std::string tok_decode_push(TokClient* tc, int id) {
 }
 
 // ---------------------------------------------------------------------------
+// Serve mode
+// ---------------------------------------------------------------------------
+
+// Generates for one request. The caller has already taken the busy slot, so this
+// owns the GPU, the KV cache and the tokenizer subprocess for its duration.
+//
+// Streaming and non-streaming share this body because the difference is only
+// where the text goes: to the wire as it appears, or to a buffer that is sent at
+// the end. Splitting them would give two decode loops to keep in agreement.
+static void serve_generate(ServeCtx* S, glm::http::Conn* conn,
+                           const glm::http::ChatRequest& req) {
+    namespace H = glm::http;
+    glm::Config& c = *S->c;
+
+    const uint64_t n = S->seq.fetch_add(1) + 1;
+    const std::string id = H::make_id("chatcmpl", n);
+    const long created = (long)std::time(nullptr);
+    const std::string model = req.model.empty() ? S->model_name : req.model;
+
+    uint32_t want = req.max_tokens > 0 ? (uint32_t)req.max_tokens : S->default_max_tokens;
+
+    std::vector<int> ids = tok_chat_user(S->tok, req.prompt, S->think);
+    if (ids.empty()) {
+        H::send_error(conn, 500, "Internal Server Error", "server_error",
+                      "the tokenizer returned no tokens for this prompt");
+        return;
+    }
+    for (int t : ids) {
+        if (t < 0 || (uint32_t)t >= c.vocab) {
+            H::send_error(conn, 500, "Internal Server Error", "server_error",
+                          "the tokenizer produced a token outside the vocabulary");
+            return;
+        }
+    }
+
+    // Fail loudly, before any work, with the numbers that let the caller fix it.
+    // Truncating to fit would return a review of a prompt the caller did not
+    // send, which is worse than an error because it looks like an answer.
+    if ((uint64_t)ids.size() + want > (uint64_t)c.max_seq) {
+        char msg[512];
+        snprintf(msg, sizeof(msg),
+                 "prompt (%zu tokens) + max_tokens (%u) = %zu exceeds max_seq (%u). "
+                 "Send fewer tokens, lower max_tokens, or restart the server with a "
+                 "larger --max-seq.",
+                 ids.size(), want, ids.size() + want, c.max_seq);
+        H::send_error(conn, 400, "Bad Request", "invalid_request_error", msg);
+        fprintf(stderr, "[serve %s] REFUSED: prompt %zu + max_tokens %u > max_seq %u\n",
+                id.c_str(), ids.size(), want, c.max_seq);
+        return;
+    }
+
+    fprintf(stderr, "[serve %s] prompt=%zu tokens, max_tokens=%u, stream=%s, thinking=%s\n",
+            id.c_str(), ids.size(), want, req.stream ? "true" : "false",
+            S->think ? "on" : "off");
+
+    const double t0 = now_s();
+    std::vector<float> logits(c.vocab);
+    auto argmax = [&]() {
+        int best = 0;
+        for (size_t i = 1; i < logits.size(); i++) if (logits[i] > logits[best]) best = (int)i;
+        return best;
+    };
+    auto is_eos = [&](int t) {
+        for (int e : S->tok->eos_ids) if (t == e) return true;
+        return false;
+    };
+
+    if (req.stream && !H::sse_begin(conn)) return;
+
+    // Prefill runs for minutes — 156 s on a 1464-token review prompt — and emits
+    // nothing while it does. Without bytes on the wire a client's read timeout
+    // fires long before the first token, so a comment goes out every few seconds
+    // until prefill returns. Comments carry no event, so no client sees them as
+    // content.
+    std::atomic<bool> prefilling{true};
+    std::thread keepalive;
+    if (req.stream) {
+        keepalive = std::thread([&] {
+            int ticks = 0;
+            while (prefilling.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                if (++ticks % 20) continue;              // ~5 s
+                if (!prefilling.load()) break;
+                if (!H::sse_comment(conn, "prefill")) break;
+            }
+        });
+    }
+
+    std::vector<uint32_t> u(ids.begin(), ids.end());
+    glm::run_chain(c, *S->W, *S->cw, *S->lay, *S->cache, u.data(), (uint32_t)u.size(), 0,
+                   S->d_logits, nullptr, 0);
+    CUDA_OK(cudaDeviceSynchronize());
+    CUDA_OK(cudaMemcpy(logits.data(), S->d_logits, (size_t)c.vocab * sizeof(float),
+                       cudaMemcpyDeviceToHost));
+    prefilling.store(false);
+    if (keepalive.joinable()) keepalive.join();
+    const double t_prefill = now_s() - t0;
+
+    if (req.stream && !H::sse_role(conn, id, created, model)) {
+        fprintf(stderr, "[serve %s] client hung up before the first token\n", id.c_str());
+        return;
+    }
+
+    tok_decode_reset(S->tok);
+    std::string full;
+    uint32_t emitted = 0, pos = (uint32_t)u.size();
+    int next = argmax();
+    const char* finish = "length";
+    const double t_dec0 = now_s();
+
+    while (emitted < want) {
+        if (is_eos(next)) { finish = "stop"; break; }
+        const std::string frag = tok_decode_push(S->tok, next);
+        if (!frag.empty()) {
+            if (req.stream) {
+                if (!H::sse_delta(conn, id, created, model, frag)) {
+                    fprintf(stderr, "[serve %s] client hung up after %u tokens\n",
+                            id.c_str(), emitted);
+                    return;   // stop generating for a client that is gone
+                }
+            } else {
+                full += frag;
+            }
+        }
+        emitted++;
+        if (emitted >= want) break;
+        if (pos + 1 >= c.max_seq) { finish = "length"; break; }
+
+        const uint32_t t = (uint32_t)next;
+        glm::run_chain(c, *S->W, *S->cw, *S->lay, *S->cache, &t, 1, pos,
+                       S->d_logits, nullptr, 0);
+        CUDA_OK(cudaDeviceSynchronize());
+        CUDA_OK(cudaMemcpy(logits.data(), S->d_logits, (size_t)c.vocab * sizeof(float),
+                           cudaMemcpyDeviceToHost));
+        pos++;
+        next = argmax();
+    }
+
+    const double t_decode = now_s() - t_dec0;
+    fprintf(stderr,
+            "[serve %s] done: %u tokens, finish=%s | prefill %.2fs (%.2f tok/s) | "
+            "decode %.2fs (%.3f tok/s) | total %.2fs\n",
+            id.c_str(), emitted, finish, t_prefill,
+            t_prefill > 0 ? ids.size() / t_prefill : 0.0, t_decode,
+            t_decode > 0 ? emitted / t_decode : 0.0, now_s() - t0);
+
+    if (req.stream) {
+        H::sse_finish(conn, id, created, model, finish, (int)ids.size(), (int)emitted);
+    } else {
+        H::send_json(conn, 200, "OK",
+                     H::completion_json(id, created, model, full, finish,
+                                        (int)ids.size(), (int)emitted));
+    }
+}
+
+// One connection, on its own thread. /health and /v1/models never touch the
+// model, so they answer while a generation is in flight — which is the point of
+// having them.
+static void serve_connection(ServeCtx* S, int fd) {
+    namespace H = glm::http;
+    H::set_nodelay(fd);
+    // 30 s to deliver a request. The send side gets 300 s: an SSE chunk is a few
+    // hundred bytes against a socket buffer that only stays full if the client
+    // has genuinely stopped reading, and that thread holds the inference slot.
+    H::set_timeouts(fd, 30, 300);
+    H::Conn conn;
+    conn.fd = fd;
+
+    H::Request req;
+    std::string err;
+    if (!H::read_request(fd, &req, 32u << 20, &err)) {
+        H::send_error(&conn, 400, "Bad Request", "invalid_request_error", err);
+        ::close(fd);
+        S->open_conns.fetch_sub(1);
+        return;
+    }
+
+    if (req.method == "OPTIONS") {
+        H::send_response(&conn, 204, "No Content", "text/plain", "");
+    } else if (req.method == "GET" && req.path == "/health") {
+        H::send_json(&conn, 200, "OK",
+                     std::string("{\"status\":\"ok\",\"busy\":") +
+                     (S->busy.load() ? "true" : "false") + "}");
+    } else if (req.method == "GET" && (req.path == "/v1/models" || req.path == "/models")) {
+        H::send_json(&conn, 200, "OK",
+                     "{\"object\":\"list\",\"data\":[{\"id\":\"" +
+                     H::json_escape(S->model_name) +
+                     "\",\"object\":\"model\",\"created\":0,\"owned_by\":\"windlass\"}]}");
+    } else if (req.method == "POST" &&
+               (req.path == "/v1/chat/completions" || req.path == "/chat/completions")) {
+        H::ChatRequest cr;
+        std::string perr;
+        if (!H::parse_chat_request(req.body, &cr, &perr)) {
+            H::send_error(&conn, 400, "Bad Request", "invalid_request_error", perr);
+        } else {
+            bool expect = false;
+            if (!S->busy.compare_exchange_strong(expect, true)) {
+                // Refuse rather than queue. A queued request would sit for the
+                // 20+ minutes the one ahead of it takes, past every client
+                // timeout, and the caller would never learn why.
+                H::send_error(&conn, 503, "Service Unavailable", "server_error",
+                              "a request is already in flight; windlass serves one at a time");
+                fprintf(stderr, "[serve] 503: busy\n");
+            } else {
+                serve_generate(S, &conn, cr);
+                S->busy.store(false);
+            }
+        }
+    } else {
+        H::send_error(&conn, 404, "Not Found", "invalid_request_error",
+                      "no such endpoint: " + req.method + " " + req.path);
+    }
+
+    ::close(fd);
+    S->open_conns.fetch_sub(1);
+}
+
+static int serve_loop(ServeCtx* S, const char* host, int port) {
+    // A client that vanishes mid-stream must not take the process with it. The
+    // socket writes already pass MSG_NOSIGNAL; this covers the tokenizer pipe.
+    std::signal(SIGPIPE, SIG_IGN);
+
+    const int lfd = glm::http::listen_on(host, port, 16);
+    if (lfd < 0) return 1;
+    fprintf(stderr,
+            "serve: listening on %s:%d — POST /v1/chat/completions, GET /v1/models, "
+            "GET /health\n"
+            "serve: model name \"%s\", max_seq %u, default max_tokens %u, thinking %s\n"
+            "serve: one request at a time; a second concurrent request gets 503\n",
+            (host && *host) ? host : "0.0.0.0", port, S->model_name.c_str(),
+            S->c->max_seq, S->default_max_tokens, S->think ? "on" : "off");
+
+    for (;;) {
+        sockaddr_in ca{};
+        socklen_t cl = sizeof(ca);
+        int fd = ::accept(lfd, (sockaddr*)&ca, &cl);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept");
+            continue;
+        }
+        // Handlers are threads so that a second caller gets its 503 immediately
+        // instead of waiting in the listen backlog, which would be the silent
+        // queueing this is meant to avoid. The cap stops a scanner from spawning
+        // threads without bound; it is far above any real client count.
+        if (S->open_conns.fetch_add(1) >= 64) {
+            S->open_conns.fetch_sub(1);
+            ::close(fd);
+            continue;
+        }
+        std::thread(serve_connection, S, fd).detach();
+    }
+}
+
+// ---------------------------------------------------------------------------
 static void usage(const char* prog) {
     fprintf(stderr,
         "usage: %s --model-dir DIR --packed DIR (--prompt TEXT | --token-ids \"id,...\")\n"
         "          [--tokens N] [--repeat N] [--cache-experts N] [--reserve-gb N]\n"
         "          [--io-threads N] [--prefill layer|position]\n"
         "          [--timing] [--cache-telemetry] [--no-think] [--raw] [--ignore-eos]\n"
-        "          [--max-seq L]\n", prog);
+        "          [--max-seq L]\n"
+        "       %s --model-dir DIR --packed DIR --serve [--host H] [--port P]\n"
+        "          [--max-seq L] [--tokens N] [--served-model-name NAME] [--no-think]\n"
+        "          [--cache-experts N] [--reserve-gb N] [--io-threads N]\n"
+        "\n"
+        "  --serve  OpenAI-compatible HTTP: POST /v1/chat/completions (with SSE when\n"
+        "           the body sets \"stream\": true), GET /v1/models, GET /health.\n"
+        "           One request at a time; a second concurrent request gets 503.\n"
+        "           --tokens sets the default max_tokens when a request omits it.\n",
+        prog, prog);
 }
 
 int main(int argc, char** argv) {
@@ -235,6 +528,10 @@ int main(int argc, char** argv) {
     int      max_seq_arg = 0;
     bool     want_timing = false, want_telemetry = false;
     bool     think = true, raw = false, ignore_eos = false;
+    bool     want_serve = false;
+    std::string serve_host = "0.0.0.0", served_name = "windlass-glm52";
+    int      serve_port = 8081;       // 8000 is where vllm-qwen36 lives on this box
+    bool     n_gen_set = false;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -242,7 +539,11 @@ int main(int argc, char** argv) {
         else if (a == "--packed"        && i + 1 < argc) packed_dir    = argv[++i];
         else if (a == "--prompt"        && i + 1 < argc) prompt_text   = argv[++i];
         else if (a == "--token-ids"     && i + 1 < argc) token_ids_csv = argv[++i];
-        else if (a == "--tokens"        && i + 1 < argc) n_gen         = (uint32_t)atoi(argv[++i]);
+        else if (a == "--tokens"        && i + 1 < argc) { n_gen = (uint32_t)atoi(argv[++i]); n_gen_set = true; }
+        else if (a == "--serve")                         want_serve    = true;
+        else if (a == "--host"          && i + 1 < argc) serve_host    = argv[++i];
+        else if (a == "--port"          && i + 1 < argc) serve_port    = atoi(argv[++i]);
+        else if (a == "--served-model-name" && i + 1 < argc) served_name = argv[++i];
         else if (a == "--repeat"        && i + 1 < argc) repeat        = (uint32_t)atoi(argv[++i]);
         else if (a == "--cache-experts" && i + 1 < argc) forced_cap    = (uint32_t)atoi(argv[++i]);
         else if (a == "--reserve-gb"    && i + 1 < argc) reserve_gb    = (size_t)atoi(argv[++i]);
@@ -265,8 +566,21 @@ int main(int argc, char** argv) {
         else if (a == "--ignore-eos")      ignore_eos     = true;
         else { usage(argv[0]); return 1; }
     }
-    if (model_dir.empty() || packed_dir.empty() ||
-        (prompt_text.empty() == token_ids_csv.empty())) { usage(argv[0]); return 1; }
+    if (model_dir.empty() || packed_dir.empty()) { usage(argv[0]); return 1; }
+    if (want_serve) {
+        // A prompt has no meaning here — every request brings its own.
+        if (!prompt_text.empty() || !token_ids_csv.empty()) {
+            fprintf(stderr, "--serve takes its prompts from requests; "
+                            "drop --prompt/--token-ids\n");
+            return 1;
+        }
+        if (serve_port <= 0 || serve_port > 65535) {
+            fprintf(stderr, "--port %d is out of range\n", serve_port); return 1;
+        }
+        if (!n_gen_set) n_gen = 600;   // a review-sized default, not the 40 the CLI uses
+    } else if (prompt_text.empty() == token_ids_csv.empty()) {
+        usage(argv[0]); return 1;
+    }
     if (repeat == 0 || n_gen == 0) { usage(argv[0]); return 1; }
 
     cudaDeviceProp dp{}; cudaGetDeviceProperties(&dp, 0);
@@ -287,21 +601,35 @@ int main(int argc, char** argv) {
         fprintf(stderr, "failed to spawn tokenizer\n"); return 1;
     }
     std::vector<int> prompt_ids;
-    if (!token_ids_csv.empty())  prompt_ids = parse_csv_ids(token_ids_csv);
-    else if (raw)                prompt_ids = tok_encode(&tok, prompt_text);
-    else                         prompt_ids = tok_chat_user(&tok, prompt_text, think);
-    if (prompt_ids.empty()) { fprintf(stderr, "no prompt tokens\n"); return 1; }
-    fprintf(stderr, "prompt: %zu tokens (%s)\n", prompt_ids.size(),
-            !token_ids_csv.empty() ? "raw ids" : (raw ? "plain encode" :
-            (think ? "chat template, thinking ON" : "chat template, thinking OFF")));
-    for (int id : prompt_ids)
-        if (id < 0 || (uint32_t)id >= c.vocab) {
-            fprintf(stderr, "prompt token %d out of range for vocab %u\n", id, c.vocab);
-            return 1;
-        }
+    if (!want_serve) {
+        if (!token_ids_csv.empty())  prompt_ids = parse_csv_ids(token_ids_csv);
+        else if (raw)                prompt_ids = tok_encode(&tok, prompt_text);
+        else                         prompt_ids = tok_chat_user(&tok, prompt_text, think);
+        if (prompt_ids.empty()) { fprintf(stderr, "no prompt tokens\n"); return 1; }
+        fprintf(stderr, "prompt: %zu tokens (%s)\n", prompt_ids.size(),
+                !token_ids_csv.empty() ? "raw ids" : (raw ? "plain encode" :
+                (think ? "chat template, thinking ON" : "chat template, thinking OFF")));
+        for (int id : prompt_ids)
+            if (id < 0 || (uint32_t)id >= c.vocab) {
+                fprintf(stderr, "prompt token %d out of range for vocab %u\n", id, c.vocab);
+                return 1;
+            }
+    }
 
+    // Serve mode has no prompt to size the KV cache from, and the cache is
+    // allocated once at load. So max_seq is a standing decision here, and it
+    // trades directly against the expert pool: every position costs ~180 KB
+    // across the 78 layers, so 8192 is ~1.5 GB that the expert cache does not
+    // get. 8192 is chosen as roughly five review-sized prompts of headroom;
+    // raise it with --max-seq and watch the residency line that follows.
     c.max_seq = max_seq_arg > 0 ? (uint32_t)max_seq_arg
+                : want_serve    ? 8192u
                                 : (uint32_t)prompt_ids.size() + n_gen + 8;
+    if (want_serve && n_gen >= c.max_seq) {
+        fprintf(stderr, "--tokens %u leaves no room for a prompt within max_seq %u\n",
+                n_gen, c.max_seq);
+        return 1;
+    }
     // The `max_seq > index_topk` rejection that stood here until Task 4 is gone:
     // run_layer now runs the DSA indexer and masks attention with its output, so
     // above index_topk the path is sparse rather than absent. Below index_topk
@@ -376,6 +704,21 @@ int main(int argc, char** argv) {
         fprintf(stderr, "VRAM after all allocations: %.2f GB resident of %.2f GB "
                         "(%.2f GB free)\n",
                 (double)(tb - fb) / 1e9, (double)tb / 1e9, (double)fb / 1e9);
+    }
+
+    // --- serve mode ----------------------------------------------------------
+    // Everything above is identical to a CLI run: same weights, same cache, same
+    // run_chain. Serve only changes where prompts come from and where tokens go.
+    if (want_serve) {
+        ServeCtx S;
+        S.c = &c; S.W = &W; S.cw = &cw; S.lay = &lay; S.cache = &cache;
+        S.tok = &tok; S.d_logits = d_logits;
+        S.model_name = served_name;
+        S.think = think;
+        S.default_max_tokens = n_gen;
+        const int rc = serve_loop(&S, serve_host.c_str(), serve_port);
+        if (need_tok) tok_close(&tok);
+        return rc;
     }
 
     glm::Timing timing;

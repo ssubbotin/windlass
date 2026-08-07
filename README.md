@@ -63,6 +63,19 @@ python3 tools/repack_experts_glm.py --model ./glm52-mxfp4 --out ./packed_experts
 
 `--io-threads` selects the fetch strategy: `0` pinned staging only, `1` double-buffered overlap, `4` batched issue (best measured). Beyond 4 there is nothing left to overlap.
 
+### Serving
+
+```bash
+./infer_glm --model-dir ./glm52-mxfp4 --packed ./packed_experts \
+            --serve --port 8081 --max-seq 8192 --tokens 600 --no-think
+```
+
+An OpenAI-compatible endpoint: `POST /v1/chat/completions` (add `"stream": true` for SSE), `GET /v1/models`, `GET /health`. One request at a time — a second concurrent request gets `503` rather than queueing behind a generation that runs for tens of minutes. A request whose prompt plus `max_tokens` exceeds `--max-seq` is refused with a `400` naming all three numbers, since truncating to fit would answer a prompt the caller did not send.
+
+Two properties follow from the measured speed rather than from taste. Prefill takes minutes, so the stream sends SSE keepalive comments until the first token; a client that waits for any byte would otherwise time out first. And `--no-think` matters: with reasoning on, a review-sized budget is spent entirely on the reasoning trace and no answer is reached. Sampling is greedy, so `temperature` is ignored rather than silently approximated.
+
+`--max-seq` is a standing decision here, because the KV cache is allocated once at load and trades directly against the expert pool — roughly 180 KB per position across the 78 layers.
+
 Tokenization is delegated to a Python sidecar using `AutoTokenizer`, so any model with a `tokenizer.json` works without a bespoke exporter.
 
 ## Verification
