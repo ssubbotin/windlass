@@ -1,10 +1,15 @@
 # windlass — session handoff
 
-Read this first when resuming. Written 2026-08-02.
+Read this first when resuming. Written 2026-08-02, updated 2026-08-07.
+
+> **You are on branch `task-9-serve-mode`, one commit ahead of `master`.** Serve mode is written
+> and compiles but **has never run on a GPU**. The first job of the next session is a GPU window
+> to run `.superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-9-verify.sh` and `test_glm_chain`,
+> then merge. Do not report serve mode as working until that has happened.
 
 ## Where we are in one paragraph
 
-windlass runs GLM-5.2 (753B/39B, MXFP4) on one RTX PRO 6000 by streaming routed experts from NVMe. Correctness is established from MXFP4 dequant up to the full 78-layer chain. The DSA sparse-attention indexer is implemented, so the old 2048-token cap is gone. Prefill was 44× amortised in both the CUDA engine and the numpy reference. **Remaining work: a serve mode, then a real pull-request review** — the thing the engine could not do before.
+windlass runs GLM-5.2 (753B/39B, MXFP4) on one RTX PRO 6000 by streaming routed experts from NVMe. Correctness is established from MXFP4 dequant up to the full 78-layer chain. The DSA sparse-attention indexer is implemented, so the old 2048-token cap is gone. Prefill was 44× amortised in both the CUDA engine and the numpy reference. Task 8 measured a real review at **18 min 16 s** and Task 9 wrote the serve mode. **Remaining work: verify serve mode on a GPU, then the real pull-request review** — the thing the engine could not do before.
 
 ## Repos
 
@@ -57,7 +62,7 @@ Two plans, both under `docs/plans/`, with SDD ledgers in `.superpowers/sdd/<plan
 | 5 long-context oracle · 6 indexer in numpy ref · **6b layer-major (numpy)** | done |
 | 7 full chain at long context | done |
 | **8 prefill measurement** | done — decision point answered, build serve mode |
-| **9 serve mode** | next |
+| **9 serve mode** | **written and compiling, NEVER RUN ON A GPU** — branch `task-9-serve-mode` |
 | **10 PR review benchmark** | the goal |
 
 ## Key measurements
@@ -87,17 +92,39 @@ A complete `--no-think` review is **21–26 minutes**. With thinking ON it is 52
 
 **Two defects are known-undetectable and are exempted by name, not by a loosened gate**: a one-key top-k error, and `k_norm` eps 1e-6 vs 1e-5 (2.4e-03, the size of the bf16 floor).
 
-**Eleven checks that could not fail have been found in this project.** The pattern: a check whose expectation derives from the thing under test, or whose statistic is invariant to the error it targets. Every new gate gets a negative control before it is trusted.
+**Twelve checks that could not fail have been found in this project.** The pattern: a check whose expectation derives from the thing under test, or whose statistic is invariant to the error it targets. Every new gate gets a negative control before it is trusted. The twelfth came from Task 9 and is worth reading as a template: a test claimed to catch a whole-body substring scan for `max_tokens` in a request body, but a JSON encoder always escapes quotes inside message content, so content can never present a bare `"max_tokens"` to any scanner — the case was unfalsifiable in principle, not merely badly written. The reachable leak was a nested key, which is well-formed and unescaped.
+
+**The serve mode's protocol layer is CUDA-free on purpose.** `src/glm_http.cuh` includes no CUDA and no model type, so `make test_glm_http && ./test_glm_http` builds and runs **on the local workstation**, which cannot build CUDA at all. 102 checks, about a second. Parsing bugs no longer cost a GPU window. Keep it that way — anything added there that pulls in `cuda_runtime.h` gives that up.
 
 **The sparse regime is not yet covered end to end.** 1400 < `index_topk` = 2048, so the drop mask is still a no-op in the full chain; only Tasks 5 and 6 exercise real sparsity, at single-layer scale.
 
 ## Next steps
 
-1. **Task 9 — serve mode.** Take `--serve` from the pattern in `~/flash-moe/cuda_infer/infer.cu:2579-3400` (OpenAI-compatible `/v1/chat/completions`, SSE, `/v1/models`, `/health`). That fork carries **no upstream licence**, so read it as a specification and write the code fresh, as every other file here was. Tool calling is not needed. Single in-flight request; 503 when busy; fail loudly if `prompt + max_tokens > max_seq`. **The SSE keepalive is load-bearing** — a request holds the connection past 20 minutes and any client without it times out before the first token.
-2. **Task 10 — the PR review.** Add windlass to `~/boostrap-llm/bench_code_review.py`'s `MODELS`. Run `--no-think`: with thinking on, the budget goes entirely to reasoning and no review is produced. State the context, `max_tokens`, and the no-think choice, since the other models run `max_tokens: 16384` unconstrained. Judge on quality; do **not** gate on token agreement.
+1. **Verify Task 9 on a GPU.** Ask before taking the window — Qwen3.6 is in real use. Then:
+
+   ```
+   ssh aeronav-r6000 'sudo systemctl stop vllm-qwen36'
+   rsync -a --exclude '.git' --exclude 'glm-ref/' ~/windlass/ aeronav-r6000:/home/user1/windlass-build/
+   ssh aeronav-r6000 'cd /home/user1/windlass-build && make ARCH=sm_120 infer_glm'
+   # server, then in a second shell:
+   ./infer_glm --model-dir /home/user1/glm52-mxfp4 --packed /home/user1/packed_experts_glm \
+               --serve --port 8081 --max-seq 2048 --tokens 40 --no-think
+   PORT=8081 ./task-9-verify.sh          # 8 groups: health, models, 404, 400, oversize-400,
+                                          # non-streaming, streaming+keepalive, 503-when-busy
+   make ARCH=sm_120 test_glm_chain && ./test_glm_chain    # the 1.6928e-06 gate
+   ssh aeronav-r6000 'sudo systemctl start vllm-qwen36'   # confirm /v1/models on :8000 is 200
+   ```
+
+   Then merge `task-9-serve-mode` into `master`. The task report lists every design decision and
+   the reasoning behind each; the send timeout and the immediate-503 threading are the two that
+   are easy to break by "simplifying".
+
+2. **Task 10 — the PR review.** Add windlass to `~/boostrap-llm/bench_code_review.py`'s `MODELS`, pointing at `http://10.10.10.138:8081/v1/chat/completions`. Set `"streaming": True` (the benchmark already supports it, and it is what survives a 156 s prefill) and `"timeout": 3600` — the default 120 s is far short of the 21–26 minutes a review takes. Run the server with `--no-think`: with thinking on, the budget goes entirely to reasoning and no review is produced. State the context, `max_tokens`, the no-think choice and that sampling is greedy, since the other models run `max_tokens: 16384` unconstrained. Judge on quality; do **not** gate on token agreement.
 
 ## How to resume
 
-The work uses `superpowers:subagent-driven-development`: one implementer subagent per task, a review after each, findings recorded in the ledger. Task briefs come from `scripts/task-brief <plan> <N>`. Every dispatch should carry the constraints the prior tasks measured — that is what has kept defects out of committed code.
+The work uses `superpowers:subagent-driven-development` where subagents are available: one implementer per task, a review after each, findings recorded in the ledger. Every dispatch should carry the constraints the prior tasks measured — that is what has kept defects out of committed code.
+
+Task briefs are written by hand into the ledger directory (`task-N-brief.md`); earlier notes referred to a `scripts/task-brief` generator, but **no `scripts/` directory exists in this repo** and the briefs from Tasks 2–7 were all written directly.
 
 The regression gate for every task in plan 2 is `test_glm_chain` reporting **1.6928e-06 and top-5 exact** at short context. It has not moved in seven tasks; any movement means something reached into the existing forward path.
