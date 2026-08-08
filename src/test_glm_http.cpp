@@ -12,9 +12,13 @@
  * inference machine would not surface, because the output would still look like
  * a plausible review. They surface here, in a second, on any machine.
  *
- * Several cases carry a NEGATIVE CONTROL note. This project has found eleven
+ * Several cases carry a NEGATIVE CONTROL note. This project has found thirteen
  * checks that could not fail, so each parser test states the specific wrong
  * behaviour it would catch rather than merely asserting the right one.
+ *
+ * It does not follow that passing here means the server works. Two defects that
+ * this file was blind to — an invalid non-streaming body and a wrong stop-token
+ * set — surfaced in the first minute of a real run. Run task-9-verify.sh too.
  */
 #include <cstdio>
 #include <cstring>
@@ -29,6 +33,26 @@
 using namespace glm::http;
 
 static int g_fail = 0, g_run = 0;
+
+// Structural validity of a body this file builds by hand: braces and brackets
+// balance, and characters inside strings are not counted. Not a full parser —
+// enough to catch a stray delimiter, which find()-based field checks cannot see.
+static bool json_balanced(const std::string& s) {
+    int depth = 0;
+    bool in_str = false, esc = false;
+    for (char c : s) {
+        if (in_str) {
+            if (esc)            esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"')  in_str = false;
+            continue;
+        }
+        if      (c == '"')                 in_str = true;
+        else if (c == '{' || c == '[')     depth++;
+        else if (c == '}' || c == ']')     { if (--depth < 0) return false; }
+    }
+    return depth == 0 && !in_str;
+}
 
 static void check(bool ok, const char* what) {
     g_run++;
@@ -257,14 +281,23 @@ static void test_response_shapes() {
     // usage.completion_tokens. Both must be present and spelled exactly.
     const std::string j = completion_json("cmpl-1", 1700000000, "windlass",
                                           "Line one\nLine \"two\"", "stop", 1464, 600);
-    check(j.find("\"object\":\"chat.completion\"") != std::string::npos, "object field");
-    check(j.find("\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\"") != std::string::npos,
-          "choices[0].message");
-    check(j.find("\"content\":\"Line one\\nLine \\\"two\\\"\"") != std::string::npos,
-          "content escaped");
-    check(j.find("\"finish_reason\":\"stop\"") != std::string::npos, "finish_reason");
-    check(j.find("\"completion_tokens\":600") != std::string::npos, "usage.completion_tokens");
-    check(j.find("\"total_tokens\":2064") != std::string::npos, "usage.total_tokens sums");
+    // NEGATIVE CONTROL. This assertion used to be six find() calls for the six
+    // fields a client reads. Every one of them passed against a body carrying a
+    // stray quote between the message object and finish_reason, which no JSON
+    // parser would accept — substring presence is invariant to anything sitting
+    // *between* the substrings, which is the whole class of defect a hand-built
+    // JSON string is prone to. The body is fully determined by the arguments, so
+    // assert the body, character for character.
+    const std::string want =
+        "{\"id\":\"cmpl-1\",\"object\":\"chat.completion\",\"created\":1700000000,"
+        "\"model\":\"windlass\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+        "\"content\":\"Line one\\nLine \\\"two\\\"\"},\"finish_reason\":\"stop\"}],"
+        "\"usage\":{\"prompt_tokens\":1464,\"completion_tokens\":600,\"total_tokens\":2064}}";
+    if (j != want) {
+        printf("    got:  %s\n    want: %s\n", j.c_str(), want.c_str());
+    }
+    check(j == want, "completion body is exactly the expected JSON");
+    check(json_balanced(j), "completion body has balanced braces outside strings");
 }
 
 // A Conn backed by a socketpair, so the SSE writers can be read back verbatim.

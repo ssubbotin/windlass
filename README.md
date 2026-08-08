@@ -76,7 +76,7 @@ Two properties follow from the measured speed rather than from taste. Prefill ta
 
 `--max-seq` is a standing decision here, because the KV cache is allocated once at load and trades directly against the expert pool — roughly 180 KB per position across the 78 layers.
 
-Tokenization is delegated to a Python sidecar using `AutoTokenizer`, so any model with a `tokenizer.json` works without a bespoke exporter.
+Tokenization is delegated to a Python sidecar using `AutoTokenizer`, so any model with a `tokenizer.json` works without a bespoke exporter. Stop tokens come from `generation_config.json` where the model ships one, which is the only place GLM-5.2 records that `<|user|>` and `<|observation|>` end a turn — deriving them from the tokenizer's own metadata gets a plausible-looking set that stops nothing.
 
 ## Verification
 
@@ -99,7 +99,7 @@ One of those deserves emphasis: **the LoRA-epsilon defect produced the exactly c
 
 - **Long-context arithmetic is validated one layer at a time, not end to end.** GLM-5.2's DSA sparse-attention indexer is implemented and wired into attention, so the old `index_topk` (2048-token) abort is gone. Below `index_topk` the top-k selects every key, the index mask is a no-op, and the sparse path is *bit-identical* to the dense one — asserted in `test_glm_layer`. Above it, at 4096 tokens, `test_glm_layer` compares an indexer-owning layer and a consuming layer against a `transformers` oracle: with the oracle's key selection forced in, every substep agrees to the bf16 fixture floor (worst 0.83 bf16 ulp of its own scale); with the CUDA indexer choosing, the two agree on 2043 of 2048 keys and the worst substep is 10.05 ulp. The measured limits are recorded honestly: the test detects a selection error of ≳8 keys in 2048 but not 1, and it cannot see a `k_norm` eps of 1e-5 instead of 1e-6 (2.4e-03 on index scores, the same size as the bf16 floor). The full **chain** above 2048 still has no oracle — `ref_glm_chain.py` carries the same 2048 limit.
 - Single GPU. No tensor/pipeline parallelism.
-- Greedy decode. No batching, no serving API.
+- Greedy decode. No batching. The serving endpoint handles one request at a time.
 - One model family so far.
 
 ## Licence

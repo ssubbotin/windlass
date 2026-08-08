@@ -464,7 +464,7 @@ inline std::string completion_json(const std::string& id, long created,
              id.c_str(), created);
     char tail[256];
     snprintf(tail, sizeof(tail),
-             "\",\"finish_reason\":\"%s\"}],"
+             ",\"finish_reason\":\"%s\"}],"
              "\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}",
              finish_reason, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
     return std::string(head) + json_escape(model) +

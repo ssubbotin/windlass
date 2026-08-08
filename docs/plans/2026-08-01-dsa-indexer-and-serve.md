@@ -587,8 +587,10 @@ regression unmoved: `1.6928e-06`, top-5 exact at all 5 tokens.
 
 Port the pattern from `infer.cu:2579-3400` — OpenAI-compatible `/v1/chat/completions`, SSE streaming, `/v1/models`, `/health`. Tool calling is **not** required for the benchmark; skip it unless free.
 
-- [ ] Single in-flight request; return 503 when busy rather than queueing silently.
-- [ ] Honour `max_tokens`, and fail loudly if `prompt + max_tokens` exceeds the configured `max_seq`.
+- [x] Single in-flight request; return 503 when busy rather than queueing silently.
+- [x] Honour `max_tokens`, and fail loudly if `prompt + max_tokens` exceeds the configured `max_seq`.
+
+**Done and verified on the GPU.** `task-9-verify.sh` reports 25 of 25 against a running server, and `test_glm_chain` still gives 1.6928e-06 with top-5 exact. The first run found three defects that only a real server could surface: a stray quote made every non-streaming body unparseable, the test that should have caught it compared substrings and so was invariant to it, and the stop-token set was wrong — `<|user|>` and `<|observation|>` were missing while five multimodal `<|end_of_*|>` delimiters had been picked up by a keyword scan, so no completion ever ended on its own.
 
 ---
 
