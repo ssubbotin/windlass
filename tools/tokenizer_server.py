@@ -19,7 +19,7 @@ Usage:
 
 The tokenizer loads tiktoken.model + tokenization_kimi.py from the model dir.
 """
-import argparse, sys, os
+import argparse, json, sys, os
 
 def load_tok(model_dir):
     # trust_remote_code=True lets transformers pick up tokenization_kimi.py from model_dir
@@ -95,14 +95,37 @@ def cmd_serve(args):
     if tok.eos_token_id is not None:
         ids = tok.eos_token_id if isinstance(tok.eos_token_id, list) else [tok.eos_token_id]
         eos_ids.extend(int(i) for i in ids)
+
+    # generation_config.json is the authority on what ends a turn, and it is the
+    # list a reference implementation actually stops on. It must be read: for
+    # GLM-5.2 the tokenizer alone reports only <|endoftext|>, while the config
+    # names <|user|> and <|observation|> as well. Without them a chat completion
+    # never stops on its own, runs to max_tokens every time, and the turn
+    # scaffolding it generated past the end leaks into the answer.
+    gen_cfg = os.path.join(args.model_dir, "generation_config.json")
+    if os.path.exists(gen_cfg):
+        with open(gen_cfg) as f:
+            cfg = json.load(f)
+        ids = cfg.get("eos_token_id")
+        if ids is not None:
+            if not isinstance(ids, list):
+                ids = [ids]
+            for i in ids:
+                if isinstance(i, int) and i not in eos_ids:
+                    eos_ids.append(int(i))
+
     # Kimi-style models often have several end-of-message ids; include any that look like one.
     for name in ("eot_token_id", "im_end_id"):
         v = getattr(tok, name, None)
         if isinstance(v, int) and v not in eos_ids:
             eos_ids.append(v)
+    # Deliberately narrow. A wider keyword scan ("end_of") matches GLM-5.2's
+    # <|end_of_image|>, <|end_of_video|>, <|end_of_audio|> and friends, which are
+    # multimodal segment delimiters and end no turn. Five wrong ids looked like a
+    # richer stop set than the config's correct three.
     added = getattr(tok, "added_tokens_encoder", {}) or {}
     for s, i in added.items():
-        if any(k in s.lower() for k in ("eos", "end_of", "eot", "<|im_end|>")):
+        if any(k in s.lower() for k in ("<|eos|>", "<|eot_id|>", "<|im_end|>", "<|endoftext|>")):
             if int(i) not in eos_ids:
                 eos_ids.append(int(i))
 

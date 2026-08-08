@@ -63,7 +63,20 @@ python3 tools/repack_experts_glm.py --model ./glm52-mxfp4 --out ./packed_experts
 
 `--io-threads` selects the fetch strategy: `0` pinned staging only, `1` double-buffered overlap, `4` batched issue (best measured). Beyond 4 there is nothing left to overlap.
 
-Tokenization is delegated to a Python sidecar using `AutoTokenizer`, so any model with a `tokenizer.json` works without a bespoke exporter.
+### Serving
+
+```bash
+./infer_glm --model-dir ./glm52-mxfp4 --packed ./packed_experts \
+            --serve --port 8081 --max-seq 8192 --tokens 600 --no-think
+```
+
+An OpenAI-compatible endpoint: `POST /v1/chat/completions` (add `"stream": true` for SSE), `GET /v1/models`, `GET /health`. One request at a time — a second concurrent request gets `503` rather than queueing behind a generation that runs for tens of minutes. A request whose prompt plus `max_tokens` exceeds `--max-seq` is refused with a `400` naming all three numbers, since truncating to fit would answer a prompt the caller did not send.
+
+Two properties follow from the measured speed rather than from taste. Prefill takes minutes, so the stream sends SSE keepalive comments until the first token; a client that waits for any byte would otherwise time out first. And `--no-think` matters: with reasoning on, a review-sized budget is spent entirely on the reasoning trace and no answer is reached. Sampling is greedy, so `temperature` is ignored rather than silently approximated.
+
+`--max-seq` is a standing decision here, because the KV cache is allocated once at load and trades directly against the expert pool — roughly 180 KB per position across the 78 layers.
+
+Tokenization is delegated to a Python sidecar using `AutoTokenizer`, so any model with a `tokenizer.json` works without a bespoke exporter. Stop tokens come from `generation_config.json` where the model ships one, which is the only place GLM-5.2 records that `<|user|>` and `<|observation|>` end a turn — deriving them from the tokenizer's own metadata gets a plausible-looking set that stops nothing.
 
 ## Verification
 
@@ -86,7 +99,7 @@ One of those deserves emphasis: **the LoRA-epsilon defect produced the exactly c
 
 - **Long-context arithmetic is validated one layer at a time, not end to end.** GLM-5.2's DSA sparse-attention indexer is implemented and wired into attention, so the old `index_topk` (2048-token) abort is gone. Below `index_topk` the top-k selects every key, the index mask is a no-op, and the sparse path is *bit-identical* to the dense one — asserted in `test_glm_layer`. Above it, at 4096 tokens, `test_glm_layer` compares an indexer-owning layer and a consuming layer against a `transformers` oracle: with the oracle's key selection forced in, every substep agrees to the bf16 fixture floor (worst 0.83 bf16 ulp of its own scale); with the CUDA indexer choosing, the two agree on 2043 of 2048 keys and the worst substep is 10.05 ulp. The measured limits are recorded honestly: the test detects a selection error of ≳8 keys in 2048 but not 1, and it cannot see a `k_norm` eps of 1e-5 instead of 1e-6 (2.4e-03 on index scores, the same size as the bf16 floor). The full **chain** above 2048 still has no oracle — `ref_glm_chain.py` carries the same 2048 limit.
 - Single GPU. No tensor/pipeline parallelism.
-- Greedy decode. No batching, no serving API.
+- Greedy decode. No batching. The serving endpoint handles one request at a time.
 - One model family so far.
 
 ## Licence

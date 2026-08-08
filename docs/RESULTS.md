@@ -53,6 +53,18 @@ A check that has never failed is not evidence. Each defect was injected into a c
 
 Measured at the reference level, a final-hidden-state comparison catches **1 of 7** injected defects; per-substep catches **6 of 7**. The residual stream dilutes any single block's contribution by 21–56×.
 
+### The arithmetic being right does not make the output right
+
+Thirteen checks that could not fail have been found in this project. Two of the most instructive came from the serving layer, where the arithmetic is untouched and every number above still holds.
+
+The stop-token set was derived from the tokenizer's own metadata by scanning added tokens for `eos|end_of|eot`. On GLM-5.2 that yields six ids: `<|endoftext|>` plus `<|end_of_image|>`, `<|end_of_video|>`, `<|end_of_audio|>`, `<|end_of_transcription|>` and `<|end_of_box|>`. Five of the six are multimodal segment delimiters that end no turn, and the two that do end one — `<|user|>` and `<|observation|>` — were absent. They are recorded only in `generation_config.json`. The consequence is that no completion ever stops on its own: every request runs to `max_tokens` and the turn scaffolding the model generates past the real end is served as part of the answer. At 0.637 tok/s that is twenty minutes of decode spent on text that should not exist.
+
+Nothing about the symptom pointed at the cause. Six ids reads as a *richer* stop set than the correct three, so the wrong list looked like the more careful one.
+
+The second is a plain lesson about assertion strength. A hand-built JSON response body was checked with six `find()` calls, one per field a client reads. All six passed against a body carrying a stray quote that no parser would accept — **substring presence is invariant to anything sitting between the substrings**, which is exactly the defect class hand-built JSON produces. The fix was to assert the body character for character, since it is fully determined by its arguments, and to add a brace-balance check that tracks string state.
+
+Both defects were invisible to compilation and to a 98-check host-side protocol suite, and both surfaced in the first minute of a real server run.
+
 ## Throughput
 
 Eight identical requests in one process, 60 tokens each, warm:

@@ -4,6 +4,10 @@ test_glm_chain
 test_glm_layer
 test_glm_expert_cache
 test_glm_mxfp4
+test_glm_indexer
+test_glm_indexer_loader
+test_glm_index_share
+test_glm_http
 *.o
 
 # Model weights and derived data — never commit
