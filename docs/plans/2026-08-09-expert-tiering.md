@@ -101,3 +101,39 @@ The three-PR review harness has 18% drift on an identical binary and cannot reso
 about 20%. All A/B work uses the paired 150-token same-prompt harness with `--ignore-eos`
 (mean-level noise floor 0.4%) behind an idle-device gate; the three reviews are a confirmation
 population, run once at the end, never used to choose between variants.
+
+## Prior measurements from the earlier engine, and what they change here
+
+The flash-moe fork carries a `cuda` lineage that hit several of these questions first, on the same
+card. No code is taken from it (it has no upstream licence); these are its recorded measurements
+and the conclusions they force here.
+
+**Hiding fetches under idle compute is dead, and was already paid for.** Overlapping the shared
+expert's forward pass with expert I/O on a separate stream was built, measured **neutral cold and
+warm, and reverted** — the shared expert is **0.03 ms per layer** against roughly 13 ms of fetch.
+That closes resource (e) from this plan's inventory at a factor of ~400. Compute is 3.5% of the
+step; there is no meaningful shadow to hide 20 MB reads in.
+
+**The Qwen3.5-397B comparison in Task 10 was against a known-broken configuration, and the write-up
+overstates it.** That result is degenerate word association, and the engine that produced it later
+gained temperature 0.6, top-p 0.95, a repetition penalty of 1.3 over a 1024-token ring buffer, and a
+degeneration detector that forces `</think>` when more than 75% of the last 32 tokens carry no ASCII
+letters. The stored benchmark predates all of it. So "no large-MoE-from-storage engine had produced
+a real review" is true of that *run*, not of that engine, and Task 10 cleared a lower bar than it
+claims. The fix is a re-run of that model with sampling enabled, not a stronger claim here.
+
+**windlass is greedy with no repetition penalty — the exact configuration that degenerated.** Three
+clean reviews are not evidence of robustness against this. A repetition penalty and a degeneration
+detector are cheap and belong in serve mode before the next benchmark, independent of throughput.
+
+**The thinking finding from Task 8 has a known mechanism and a better fix than `--no-think`.**
+Greedy decoding barely favours `</think>` over content on long prompts, which is why a review-sized
+budget with thinking on produced no review at all. The earlier engine's answer is a **think budget**:
+cap reasoning at `max_tokens/2`, then force-inject `</think>`. That keeps reasoning on a review-sized
+budget instead of disabling it, and it is strictly better than the flag Task 10 shipped with.
+
+**A prefill optimisation to approach with care.** KV/delta snapshot save-and-restore was found to
+produce different output than a fresh prefill on CUDA, root cause never established, and was worked
+around by re-prefilling every request at a cost of ~2 s. Our prefill is **156 s**, so the same
+shortcut is roughly eighty times more tempting here and carries a known-unresolved correctness
+hazard. Anything of that shape needs the byte-identical-output gate from item 2 above, run first.
