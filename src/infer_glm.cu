@@ -49,6 +49,7 @@
 #include <cuda_runtime.h>
 
 #include "glm_http.cuh"
+#include "glm_sampling.cuh"
 #include "safetensors_io.cuh"
 #include "glm_primitives.cuh"
 #include "glm_kernels.cuh"
@@ -201,6 +202,12 @@ struct ServeCtx {
     std::atomic<bool>     busy{false};
     std::atomic<uint64_t> seq{0};
     std::atomic<int>      open_conns{0};
+    // Degeneration defences, all inert at these defaults. Greedy argmax with no
+    // penalty is what every correctness result here was measured under.
+    float    rep_penalty    = 1.0f;
+    size_t   rep_window     = 1024;
+    size_t   degen_window   = 0;       // 0 = detector off
+    float    degen_min_frac = 0.25f;
 };
 
 static std::vector<int> parse_csv_ids(const std::string& s) {
@@ -303,9 +310,15 @@ static void serve_generate(ServeCtx* S, glm::http::Conn* conn,
 
     const double t0 = now_s();
     std::vector<float> logits(c.vocab);
+    // Defences are inert unless configured, so the default decode path stays
+    // exactly the greedy argmax every correctness result was measured under.
+    glm::sampling::RepetitionPenalty rep(S->rep_penalty, S->rep_window);
+    glm::sampling::DegenerationDetector degen(S->degen_window, S->degen_min_frac);
     auto argmax = [&]() {
+        rep.apply(logits.data(), (int)logits.size());
         int best = 0;
         for (size_t i = 1; i < logits.size(); i++) if (logits[i] > logits[best]) best = (int)i;
+        rep.observe(best);
         return best;
     };
     auto is_eos = [&](int t) {
@@ -359,6 +372,17 @@ static void serve_generate(ServeCtx* S, glm::http::Conn* conn,
     while (emitted < want) {
         if (is_eos(next)) { finish = "stop"; break; }
         const std::string frag = tok_decode_push(S->tok, next);
+        degen.observe(frag);
+        if (degen.degenerate()) {
+            // The model is emitting valid distinct tokens whose character mix
+            // has collapsed. Stopping here costs the tail of one answer; not
+            // stopping costs the whole remaining budget at 1.1 s per token.
+            fprintf(stderr, "[serve %s] degeneration at %u tokens "
+                    "(letter fraction %.2f) — stopping\n",
+                    id.c_str(), emitted, degen.letter_fraction());
+            finish = "stop";
+            break;
+        }
         if (!frag.empty()) {
             if (req.stream) {
                 if (!H::sse_delta(conn, id, created, model, frag)) {
@@ -521,6 +545,7 @@ static void usage(const char* prog) {
         "          [--max-seq L] [--tokens N] [--served-model-name NAME] [--no-think]\n"
         "          [--cache-experts N] [--reserve-gb N] [--io-threads N]\n"
         "          [--host-cache GB] [--host-cache-pin] [--o-direct]\n"
+        "          [--rep-penalty F] [--degen-window N]\n"
         "\n"
         "  --serve  OpenAI-compatible HTTP: POST /v1/chat/completions (with SSE when\n"
         "           the body sets \"stream\": true), GET /v1/models, GET /health.\n"
@@ -538,6 +563,8 @@ int main(int argc, char** argv) {
     uint32_t host_gb    = 0;          // --host-cache GB; exclusive victim slab, 0 = off
     bool     host_pin   = false;      // --host-cache-pin; measured worthless on this box
     bool     o_direct   = false;      // --o-direct; only correct alongside --host-cache
+    float    rep_penalty  = 1.0f;     // --rep-penalty; 1.0 = off, the measured configuration
+    size_t   degen_window = 0;        // --degen-window; 0 = detector off
     int      max_seq_arg = 0;
     bool     want_timing = false, want_telemetry = false;
     bool     think = true, raw = false, ignore_eos = false;
@@ -564,6 +591,8 @@ int main(int argc, char** argv) {
         else if (a == "--host-cache"    && i + 1 < argc) host_gb       = (uint32_t)atoi(argv[++i]);
         else if (a == "--host-cache-pin")                host_pin      = true;
         else if (a == "--o-direct")                      o_direct      = true;
+        else if (a == "--rep-penalty"   && i + 1 < argc) rep_penalty   = (float)atof(argv[++i]);
+        else if (a == "--degen-window"  && i + 1 < argc) degen_window  = (size_t)atoi(argv[++i]);
         else if (a == "--max-seq"       && i + 1 < argc) max_seq_arg   = atoi(argv[++i]);
         // Task 4b's A/B. "layer" routes all prompt positions of a layer at once
         // and fetches each unique expert once; "position" is the pre-4b loop,
@@ -733,6 +762,11 @@ int main(int argc, char** argv) {
         S.model_name = served_name;
         S.think = think;
         S.default_max_tokens = n_gen;
+        S.rep_penalty  = rep_penalty;
+        S.degen_window = degen_window;
+        if (rep_penalty > 1.0f || degen_window > 0)
+            fprintf(stderr, "serve: degeneration defences — rep-penalty %.2f, "
+                    "degen window %zu chars\n", rep_penalty, degen_window);
         const int rc = serve_loop(&S, serve_host.c_str(), serve_port);
         if (need_tok) tok_close(&tok);
         return rc;

@@ -111,6 +111,25 @@ static void test_degeneration() {
     }
 }
 
+// The serve driver constructs both defences unconditionally and relies on the
+// DEFAULT arguments being fully inert, because that is the configuration every
+// correctness result in this repository was measured under and the one the
+// byte-identical-output gate needs reachable. If a default ever changes, this
+// fails rather than silently altering generated text on every request.
+static void test_defaults_are_inert() {
+    printf("driver defaults are inert\n");
+    RepetitionPenalty rp(1.0f, 1024);          // ServeCtx defaults
+    DegenerationDetector d(0, 0.25f);
+    check(!rp.active(), "default penalty 1.0 is inert");
+    check(!d.active(), "default degen window 0 is inert");
+    std::vector<float> lg = {5.0f, -5.0f};
+    for (int i = 0; i < 50; i++) { rp.observe(0); rp.observe(1); }
+    rp.apply(lg.data(), 2);
+    check(lg[0] == 5.0f && lg[1] == -5.0f, "logits are bit-unchanged at defaults");
+    for (int i = 0; i < 50; i++) d.observe(std::string(64, '\x01'));
+    check(!d.degenerate(), "a disabled detector never fires, whatever it sees");
+}
+
 static void test_think_budget() {
     printf("think budget\n");
     {
@@ -144,6 +163,7 @@ int main() {
     test_repetition();
     test_degeneration();
     test_think_budget();
+    test_defaults_are_inert();
     printf("=== %d checks, %d failed ===\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }
