@@ -137,3 +137,43 @@ produce different output than a fresh prefill on CUDA, root cause never establis
 around by re-prefilling every request at a cost of ~2 s. Our prefill is **156 s**, so the same
 shortcut is roughly eighty times more tempting here and carries a known-unresolved correctness
 hazard. Anything of that shape needs the byte-identical-output gate from item 2 above, run first.
+
+## Item 2 redesign: the trace replay, and what it decided
+
+`tools/replay_expert_trace.py` replays a real 108,127-lookup routing trace (1042-token prefill plus
+149 decode steps) and charges both directions of PCIe at this machine's measured rates.
+
+```
+                              host serves    NVMe    D2H     vs baseline
+GPU only (shipped)                    0     56836      0        1.00x
+victim-fill,  86 GB               18251     38585  53764        0.75x
+fetch-fill,   86 GB                7966     48870      0        1.11x
+victim-fill, 112 GB               21828     35008  53764        0.77x
+fetch-fill,  112 GB               12218     44618      0        1.19x
+```
+
+**Victim-fill loses at every capacity.** It pays 53,764 writes to collect 21,828 serves, and the
+council's simulators scored the read side only. This reproduces the live measurement in both
+direction and rough magnitude: unpinned victim-fill measured 0.940 against a 1.058 baseline, and it
+pulled O_DIRECT down from 1.572 to 1.481. The 2.24 tok/s figure was the corrupted run taking a
+cheaper path and was never real.
+
+**Expert weights are read-only, so the writeback was never needed at all.** A host copy taken at
+fetch time cannot go stale. The victim rule was importing a writeback discipline from caches that
+hold mutable data; here the bytes are immutable, the staging buffer already contains them, and a
+host-to-host memcpy puts them in the slab off the PCIe bus entirely. That removes the D2H, the write
+amplification, and the entire class of cross-stream slot-ownership races that cost three patches:
+the slab becomes CPU-write-only, and the GPU only ever reads from it.
+
+The cost is exclusivity. Fetch-fill duplicates whatever the GPU holds, so it serves 14-21% of misses
+against victim-fill's 32-38%. That is the trade the council's 0.4999-vs-0.2124 result measured, and
+with the write side charged the cheaper-but-inclusive rule still wins by 1.49-1.53x.
+
+**Decision: build fetch-fill at the largest slab that allocates cleanly (112 GB / 5568 slots).**
+Expected 1.19x on top of O_DIRECT, i.e. roughly 1.06 -> 1.87 tok/s against the shipped 1.058.
+Caveat carried forward: the replay's absolute tok/s is not calibrated (it divides prefill lookups
+across decode tokens); only the ratios are load-bearing, and the build is gated on the
+byte-identical-output check, not on the model.
+
+**Ceiling unchanged.** Belady on this trace is 3.64-4.02 tok/s. Tiering does not reach a
+sub-4-minute review, and after this item the data-movement family is close to spent.
