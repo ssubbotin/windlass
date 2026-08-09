@@ -177,3 +177,34 @@ byte-identical-output check, not on the model.
 
 **Ceiling unchanged.** Belady on this trace is 3.64-4.02 tok/s. Tiering does not reach a
 sub-4-minute review, and after this item the data-movement family is close to spent.
+
+### Item 2 built: fetch-fill measures +3.2%, and that closes the tiering family
+
+Built, correct (greedy output byte-identical to baseline, hit rate identical at 52.7%), and much
+smaller than every projection:
+
+```
+baseline                       1.058 tok/s
+--o-direct                     1.572 tok/s   +48.6%
+--o-direct --host-cache 104    1.623 tok/s   +3.2% over O_DIRECT alone
+```
+
+The slab works. It serves **29.9% of GPU misses**, better than the replay's predicted 21.5%. What
+the replay got wrong is that it charged the CPU memcpy at zero. Over the run the fills move
+**642 GB through host memory**, and the fill-to-serve ratio is **2.33** — the same write
+amplification the victim rule had, relocated from PCIe onto the CPU. A 20 MB memcpy costs roughly
+what the 20 MB NVMe read it hopes to save costs, so paying 2.33 of them per serve is close to a
+wash, and only overlap across the four workers keeps it positive at all.
+
+**Conclusion: the host-tier family is worth ~3%, not the 2.0-2.4x the council projected.** Every
+variant of it pays about one expert-sized copy per fill and recovers well under half a copy per
+serve; the exclusive rule pays it on PCIe, the inclusive rule pays it on the CPU, and neither
+inverts the ratio. The council's simulators ranked designs on hit rate, and hit rate was never the
+binding constraint — the fill cost was, and no candidate charged it.
+
+The build is kept (correct, on by default nowhere, +3.2% when asked for) but the family is closed.
+**The remaining lever with real headroom is bytes per token, and both known routes into it are
+already measured shut**: lossless compression (entropy 3.769/4) and cross-expert redundancy (nibble
+agreement 0.0764 against a 0.0757 chance baseline). What is NOT yet measured is lossy: a
+reduced-precision draft copy of every expert, used speculatively and verified against the full one.
+That is the only untested route to fewer bytes and it needs its own oracle before any code.

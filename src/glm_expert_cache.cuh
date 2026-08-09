@@ -177,7 +177,6 @@ public:
         }
         free_slots_.reserve(capacity_);
         for (uint32_t i = 0; i < capacity_; i++) free_slots_.push_back(i);
-        slot_fill_ev_.assign(capacity_, nullptr);
 
         // pinned staging for the synchronous path
         if (cudaHostAlloc((void**)&sync_buf_, EXPERT_BYTES, cudaHostAllocDefault)
@@ -226,22 +225,10 @@ public:
             } else host_pinned_ = true;
         }
         host_iter_.resize(host_capacity_);
-        host_last_ev_.assign(host_capacity_, nullptr);
         host_free_.reserve(host_capacity_);
         for (uint32_t i = host_capacity_; i-- > 0; ) host_free_.push_back(i);
-        fprintf(stderr,
-            "\n*** ExpertCache: --host-cache IS KNOWN INCORRECT AND MUST NOT BE USED ***\n"
-            "    It measures 2.24 tok/s against 1.06 baseline, so the headroom is real,\n"
-            "    but greedy decode diverges from the baseline's token stream, which under\n"
-            "    identical prompt and sampling can only mean the slab serves wrong bytes.\n"
-            "    Three ordering defects were found and fixed and a fourth remains:\n"
-            "      1. a taken slot returned to the free list while its H2D was pending;\n"
-            "      2. no cross-stream ordering between a slot's D2H writer and H2D reader;\n"
-            "      3. the eviction D2H not ordered behind the outgoing block's own fill.\n"
-            "    Pageable memory hid all of them by making every copy synchronous.\n"
-            "    Use --o-direct alone (+48%%, byte-identical output) until this is redesigned.\n\n");
-        fprintf(stderr, "ExpertCache: host victim slab %u slots = %.2f GB (%s), "
-                "exclusive of the %u-slot VRAM pool -> %u distinct experts resident "
+        fprintf(stderr, "ExpertCache: host expert slab %u slots = %.2f GB (%s), fetch-filled "
+                "by CPU memcpy, never written back; %u-slot VRAM pool, %u slab slots "
                 "(%.1f%% of the routed set)\n",
                 host_capacity_, (double)want / 1e9,
                 host_pinned_ ? "pinned" : "pageable",
@@ -258,7 +245,7 @@ public:
             host_slab_ = nullptr;
         }
         host_slot_for_.clear(); host_lru_.clear(); host_iter_.clear();
-        host_free_.clear(); host_pending_.clear(); host_last_ev_.clear();
+        host_free_.clear();
         for (int fd : layer_fds_) if (fd >= 0) ::close(fd);
         layer_fds_.clear();
         if (pool_) { cudaFree(pool_); pool_ = nullptr; }
@@ -281,7 +268,6 @@ public:
                   cudaStream_t stream) override {
         resolved_.clear();
         if (workers_.empty() || capacity_ < n) return;   // synchronous fallback
-        host_drain_pending();
         const uint32_t rel = layer - first_layer_;
 
         // Gate: nothing may be written into a reused slot before the compute
@@ -309,8 +295,8 @@ public:
             // Take the block out of the host slab BEFORE allocating a VRAM slot:
             // allocating may evict, and the eviction could otherwise pick the
             // very host slot we are about to read from.
-            uint32_t hs_taken = UINT32_MAX;
-            uint8_t* hsrc = host_take(key, &hs_taken);
+            const uint8_t* hsrc;
+            { std::lock_guard<std::mutex> lk(hm_); hsrc = host_lookup(key); }
 
             uint32_t evicted_key = UINT32_MAX;
             const uint32_t slot = alloc_slot(&evicted_key);
@@ -325,22 +311,13 @@ public:
             t->dst  = slot_ptr(slot);
             t->gate = gate;
             t->layer = layer; t->expert = e;
-            t->host_src  = hsrc;
-            // host_admit AFTER host_take, and the taken slot is on the pending
-            // queue rather than the free list, so this can never alias hsrc.
-            t->evict_dst = (evicted_key == UINT32_MAX) ? nullptr : host_admit(evicted_key);
-            // Both directions register t->done as the slot's last toucher: the
-            // H2D reads host_src, the D2H writes evict_dst, and both retire when
-            // t->done does.
-            // Read BEFORE overwriting: this is the fill event of the occupant
-            // being evicted, not of the block we are about to load.
-            t->evict_fill_wait = t->evict_dst ? slot_fill_ev_[slot] : nullptr;
-            slot_fill_ev_[slot] = t->done;
-            t->src_wait = host_last_ev_of(t->host_src);
-            t->dst_wait = host_last_ev_of(t->evict_dst);
-            host_mark(t->host_src,  t->done);
-            host_mark(t->evict_dst, t->done);
-            if (hs_taken != UINT32_MAX) host_pending_.push_back({hs_taken, t->done});
+            t->host_src = hsrc;
+            t->key      = key;
+            // The evicted block keeps its slab copy and only loses its LRU
+            // position, so nothing moves and nothing has to be waited on.
+            if (evicted_key != UINT32_MAX) {
+                std::lock_guard<std::mutex> lk(hm_); host_refresh(evicted_key);
+            }
             t->issued.store(false, std::memory_order_relaxed);
             t->in_use.store(true,  std::memory_order_relaxed);
             resolved_.push_back({key, slot, t});
@@ -445,10 +422,9 @@ public:
                     misses_ - host_hits_,
                     (double)(misses_ - host_hits_) * EXPERT_BYTES / 1e9);
             fprintf(stderr,
-                    "[host %s] write amplification %.2fx (%zu writes per %zu serves), "
-                    "slot stalls %zu\n", tag,
-                    host_hits_ ? (double)host_writes_ / (double)host_hits_ : 0.0,
-                    host_writes_, host_hits_, host_stalls_);
+                    "[host %s] slab fills %zu, serves %zu (fills are CPU memcpy, "
+                    "zero PCIe)\n", tag,
+                    host_writes_, host_hits_);
         }
     }
 
@@ -473,21 +449,8 @@ private:
         cudaEvent_t done = nullptr;    // recorded after the copy
         uint32_t    layer = 0, expert = 0;
         // Host victim slab, both directions. Either may be null.
-        uint8_t*    host_src = nullptr;   // serve this miss from the slab, skip the disk
-        uint8_t*    evict_dst = nullptr;  // write dst's current occupant here before overwriting
-        // The slab slots are shared across worker streams, so a copy that
-        // touches one must first wait on whatever copy touched it last. Nothing
-        // else orders them: recording the event is not the same as waiting on
-        // it, and getting that wrong produces divergent output rather than an
-        // error.
-        cudaEvent_t src_wait = nullptr;
-        cudaEvent_t dst_wait = nullptr;
-        // The eviction D2H reads the GPU slot's OUTGOING occupant. That
-        // occupant's own fill may still be in flight — a block fetched a few
-        // layers ago can already be the LRU tail — in which case the slot holds
-        // stale bytes and the slab would be handed 20 MB of the wrong expert
-        // under the right key. Silent, and it only shows up as divergent output.
-        cudaEvent_t evict_fill_wait = nullptr;
+        const uint8_t* host_src = nullptr;   // serve this miss from the slab, skip the disk
+        uint32_t    key = 0;              // for the fetch-time slab fill
         std::atomic<bool> issued{false};
         std::atomic<bool> in_use{false};
     };
@@ -509,100 +472,57 @@ private:
     // card (39.18 GB/s aggregate), both still ~2x the 9.86 GB/s the NVMe
     // delivers for this access pattern.
 
-    // Reserve a host slot for `key`, evicting the host LRU tail if needed.
-    uint8_t* host_admit(uint32_t key) {
-        if (!host_slab_ || host_capacity_ == 0) return nullptr;
+    // Admit `key` at FETCH time, copying from the pinned staging buffer the bytes
+    // already occupy. Expert weights are read-only, so this copy can never go
+    // stale and the block never has to be written back from the GPU. That is
+    // the whole design: no D2H, no write amplification, and the slab is only
+    // ever written by the CPU, so no cross-stream ownership exists to get wrong.
+    void host_fill(uint32_t key, const uint8_t* src) {
+        if (!host_slab_ || host_capacity_ == 0) return;
         auto it = host_slot_for_.find(key);
-        if (it != host_slot_for_.end()) {          // already there, refresh it
-            host_lru_.splice(host_lru_.begin(), host_lru_, host_iter_[it->second]);
-            host_iter_[it->second] = host_lru_.begin();
-            return host_ptr(it->second);
-        }
-        // A slot may not be handed out while a copy on some other worker stream
-        // is still reading from or writing to it. Slots therefore never go
-        // straight from the LRU to a caller: they pass through host_pending_,
-        // carrying the event of the last copy that touched them, and only reach
-        // the free list once that event has retired.
-        //
-        // Pageable memory hid this bug completely, because a pageable
-        // cudaMemcpyAsync is synchronous and every copy was finished before the
-        // next call returned. Pinning made the copies genuinely async and the
-        // race appeared immediately as divergent greedy output.
-        host_drain_pending();
-        if (host_free_.empty()) {
-            const uint32_t victim = host_lru_.back();
-            const uint32_t vs = host_slot_for_[victim];
-            host_slot_for_.erase(victim);
-            host_lru_.pop_back();
-            host_evictions_++;
-            host_pending_.push_back({vs, host_last_ev_[vs]});
-            host_drain_pending();
-            if (host_free_.empty()) {
-                // Everything in flight. Wait for the oldest copy rather than
-                // hand out a slot someone is still using.
-                CUDA_OK(cudaEventSynchronize(host_pending_.front().ev));
-                host_stalls_++;
-                host_drain_pending();
+        uint32_t hs;
+        if (it != host_slot_for_.end()) {
+            hs = it->second;
+            host_lru_.splice(host_lru_.begin(), host_lru_, host_iter_[hs]);
+        } else {
+            if (!host_free_.empty()) { hs = host_free_.back(); host_free_.pop_back(); }
+            else {
+                const uint32_t victim = host_lru_.back();
+                hs = host_slot_for_[victim];
+                host_slot_for_.erase(victim);
+                host_lru_.pop_back();
+                host_evictions_++;
             }
+            host_slot_for_[key] = hs;
+            host_lru_.push_front(key);
+            host_writes_++;
         }
-        const uint32_t hs = host_free_.back(); host_free_.pop_back();
-        host_slot_for_[key] = hs;
-        host_lru_.push_front(key);
         host_iter_[hs] = host_lru_.begin();
-        host_writes_++;
-        return host_ptr(hs);
+        std::memcpy(host_ptr(hs), src, EXPERT_BYTES);
     }
 
-    // Take `key` OUT of the slab. Exclusive means a block promoted back to VRAM
-    // must not stay here — leaving it would silently convert the tier to the
-    // mirroring design that measured less than half as well.
-    //
-    // The slot is NOT returned to the free list here. Its bytes are the source
-    // of an H2D copy that has only been ENQUEUED, so releasing it immediately
-    // lets a later host_admit in this same 8-expert batch hand the same slot out
-    // as an eviction destination — and the D2H then overwrites the bytes the
-    // pending H2D still has to read. That is not a rare race: within one batch
-    // the freed slot is at the top of the free list and gets picked first.
-    //
-    // Caught by output divergence under greedy decode, which is the cheapest
-    // correctness gate this engine has and the only one that would have noticed.
-    // Slots go on a pending queue and are released once their copy's event has
-    // actually completed.
-    uint8_t* host_take(uint32_t key, uint32_t* slot_out) {
-        *slot_out = UINT32_MAX;
+    // Give a block a fresh window when the GPU drops it. This is what the victim
+    // rule bought, obtained here without moving a byte: the copy is already
+    // resident, so only its LRU position needs to change.
+    void host_refresh(uint32_t key) {
+        if (!host_slab_ || host_capacity_ == 0) return;
+        auto it = host_slot_for_.find(key);
+        if (it == host_slot_for_.end()) return;
+        host_lru_.splice(host_lru_.begin(), host_lru_, host_iter_[it->second]);
+        host_iter_[it->second] = host_lru_.begin();
+    }
+
+    // Look up without removing. Inclusive by design: the duplicate costs slab
+    // capacity and nothing else, and the replay says that trade wins by 1.5x
+    // once the writeback the exclusive rule needs is charged.
+    const uint8_t* host_lookup(uint32_t key) {
         if (!host_slab_ || host_capacity_ == 0) return nullptr;
         auto it = host_slot_for_.find(key);
         if (it == host_slot_for_.end()) return nullptr;
-        const uint32_t hs = it->second;
-        host_lru_.erase(host_iter_[hs]);
-        host_slot_for_.erase(it);
+        host_lru_.splice(host_lru_.begin(), host_lru_, host_iter_[it->second]);
+        host_iter_[it->second] = host_lru_.begin();
         host_hits_++;
-        *slot_out = hs;
-        return host_ptr(hs);
-    }
-
-    // Release host slots whose promoting copy has retired. Conservative by
-    // construction: `ev` is recycled with its IoTask, and a recycled event can
-    // only have been re-recorded LATER, so a completed query is never early.
-    void host_drain_pending() {
-        while (!host_pending_.empty()) {
-            const PendingFree& p = host_pending_.front();
-            if (p.ev && cudaEventQuery(p.ev) != cudaSuccess) break;
-            host_free_.push_back(p.hs);
-            host_pending_.pop_front();
-        }
-    }
-
-    // Record which copy last touched slot `hs`, in either direction. Anything
-    // that later wants the slot must wait on this before reusing it.
-    cudaEvent_t host_last_ev_of(uint8_t* p) const {
-        if (!p) return nullptr;
-        return host_last_ev_[(size_t)(p - host_slab_) / EXPERT_BYTES];
-    }
-
-    void host_mark(uint8_t* p, cudaEvent_t ev) {
-        if (!p) return;
-        host_last_ev_[(size_t)(p - host_slab_) / EXPERT_BYTES] = ev;
+        return host_ptr(it->second);
     }
 
     // Take a free slot, or evict the LRU tail. Never evicts an entry inserted
@@ -712,19 +632,10 @@ private:
             // Save the outgoing occupant into the host slab before it is
             // overwritten. Same stream as the H2D that follows, so the ordering
             // is structural rather than something a future edit can transpose.
-            if (t->evict_dst) {
-                if (t->evict_fill_wait)
-                    CUDA_OK(cudaStreamWaitEvent(streams_[w], t->evict_fill_wait, 0));
-                if (t->dst_wait) CUDA_OK(cudaStreamWaitEvent(streams_[w], t->dst_wait, 0));
-                CUDA_OK(cudaMemcpyAsync(t->evict_dst, t->dst, EXPERT_BYTES,
-                                        cudaMemcpyDeviceToHost, streams_[w]));
-            }
-
             if (t->host_src) {
                 // Slab hit. The bytes are already in host memory, so the pinned
                 // staging buffer and the disk are both skipped entirely.
                 host_serves_++;
-                if (t->src_wait) CUDA_OK(cudaStreamWaitEvent(streams_[w], t->src_wait, 0));
                 CUDA_OK(cudaMemcpyAsync(t->dst, t->host_src, EXPERT_BYTES,
                                         cudaMemcpyHostToDevice, streams_[w]));
             } else {
@@ -746,6 +657,13 @@ private:
                 CUDA_OK(cudaMemcpyAsync(t->dst, buf, EXPERT_BYTES,
                                         cudaMemcpyHostToDevice, streams_[w]));
                 CUDA_OK(cudaEventRecord(buf_ev_[base + turn], streams_[w]));
+                // The bytes are in `buf` now and immutable forever, so the slab
+                // can take a copy without touching the GPU or the bus. Under the
+                // slab lock because prefetch() reads the same maps.
+                if (host_slab_) {
+                    std::lock_guard<std::mutex> lk(hm_);
+                    host_fill(t->key, buf);
+                }
                 used[turn] = true;
                 turn = (turn + 1) % BUFS_PER_WORKER;
             }
@@ -782,12 +700,10 @@ private:
     std::unordered_map<uint32_t, uint32_t> host_slot_for_;
     std::list<uint32_t>                    host_lru_;
     std::vector<std::list<uint32_t>::iterator> host_iter_;
-    std::vector<cudaEvent_t> host_last_ev_;   // last copy to touch each slab slot
-    std::vector<cudaEvent_t> slot_fill_ev_;   // last copy to fill each VRAM slot
+
     std::vector<uint32_t> host_free_;
-    struct PendingFree { uint32_t hs; cudaEvent_t ev; };
-    std::deque<PendingFree> host_pending_;
-    size_t host_hits_ = 0, host_writes_ = 0, host_evictions_ = 0, host_stalls_ = 0;
+    std::mutex hm_;                           // guards the slab maps
+    size_t host_hits_ = 0, host_writes_ = 0, host_evictions_ = 0;
     std::atomic<size_t> host_serves_{0};
 
     // --- prefetch machinery (empty/idle when io_threads == 0) ---------------
