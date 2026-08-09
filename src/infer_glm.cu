@@ -370,6 +370,15 @@ static void serve_generate(ServeCtx* S, glm::http::Conn* conn,
                 full += frag;
             }
         }
+        // A non-streaming reply writes nothing until the end, so it cannot learn
+        // from a failed write that the client is gone. Ask the socket instead,
+        // every 16 tokens — at 1.6 s per token that is a check every ~25 s, and
+        // it bounds how long a dead client can hold the single inference slot.
+        if (!req.stream && (emitted % 16) == 15 && conn->peer_gone()) {
+            fprintf(stderr, "[serve %s] client hung up after %u tokens\n",
+                    id.c_str(), emitted + 1);
+            return;
+        }
         emitted++;
         if (emitted >= want) break;
         if (pos + 1 >= c.max_seq) { finish = "length"; break; }

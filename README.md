@@ -25,15 +25,27 @@ Correctness is established. Throughput is not competitive, and the measurements 
 
 See [docs/RESULTS.md](docs/RESULTS.md) for the full measurements, the negative controls, and the throughput analysis.
 
+## It reviews real pull requests
+
+The point of the engine. Three real PRs from a working Gitea instance, reviewed end to end:
+
+```
+prefill 9.30 tok/s   decode 0.889 tok/s   21m30s per review, all three ending on EOS
+```
+
+Each review is structured to the prompt and file-scoped. On a C++ Levinson-Durbin solver it identified a division by zero when the prediction error reaches zero, with the trigger condition and a fix; on a TypeScript player it traced `parseFloat("")` → `NaN` through both branches of a validator to show the fallback is bypassed. Twenty minutes a review is a nightly-batch tool, not an interactive one.
+
 ## The finding
 
-Expert fetch is **87.6% of layer time**. The obvious conclusion is "buy a faster SSD," and it is wrong.
+Expert fetch is **87.6% of layer time**, and the bottleneck is a host memory copy rather than the SSD.
 
-Expert selection is **data-dependent per layer**: layer L+1's router cannot run until layer L finishes. A decode step therefore never has more than 8 — mean 3.5 — 20 MB reads in flight, regardless of device speed. The pipeline is structurally shallow-queued. Raising the I/O worker count from 4 to 8 changes nothing (+0.5%, not significant) because there is nothing more to issue.
+Measured on the device and the real packed files: NVMe random reads of the 20 MB expert stride reach **8.78 GB/s at queue depth 1** and 9.26 GB/s at QD 4, with latency scaling linearly past that — the device saturates at depth 1. But the fetch path opens with plain `O_RDONLY`, and **buffered reads measure 6.7 GB/s even with the page cache warm**, because every read pays `copy_to_user`. Effective decode rate works out to 6.0 GB/s: 336 misses × 20.05 MB ÷ 1.125 s per token, predicting 1006 ms of fetch against 985 ms measured.
 
-The escapes are speculative cross-layer prefetch, popularity-resident pinning, or moving fewer bytes — not faster storage.
+So the engine sits on the buffered-read ceiling, 35% below what the storage already delivers, while the GPU is idle 96.5% of the time and host-to-device runs at **49.4 GB/s from pinned memory** — 5.3× the SSD, and never used as a cache tier.
 
-An independent implementation, [Colibri](https://github.com/uv-genai/colibri) (pure C, CPU-first), reports **1.23 tok/s** peak on GLM-5.2. This engine measures **1.227 tok/s** on a different architecture entirely. Two independent implementations converging suggests the wall belongs to the technique, not to either codebase.
+An earlier version of this section argued the pipeline was *structurally shallow-queued*: expert selection is data-dependent per layer, so a decode step never has more than 8 — mean 3.5 — reads in flight. The shallow queue is real, and it is not what binds. The 4→8 io-thread null (+0.5%) was read as "nothing left to issue" when it means "the device was already full at 1."
+
+An independent implementation, [Colibri](https://github.com/uv-genai/colibri) (pure C, CPU-first), reports **1.23 tok/s** peak on GLM-5.2, against 1.227 here. That was read as two implementations converging on a limit belonging to the technique. A GPU engine tying a CPU engine on a pure data-movement problem is better evidence of an unoptimised data path.
 
 ## Build
 

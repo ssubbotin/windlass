@@ -356,6 +356,31 @@ struct Conn {
         return true;
     }
     bool alive() { std::lock_guard<std::mutex> lk(mu); return !dead; }
+
+    // Has the peer hung up? A streaming reply notices on its own, because the
+    // next write fails. A non-streaming reply writes nothing until the very end,
+    // so a client that goes away at minute one leaves this thread generating for
+    // the remaining fifty — and it holds the single inference slot the whole
+    // time, so the server 503s everything else meanwhile.
+    //
+    // A closed peer has sent FIN, so a non-blocking peek returns 0. Anything the
+    // client sent after its request is pipelining we do not support; treat it as
+    // still-alive and leave the bytes in the buffer. EAGAIN is the normal case:
+    // nothing to read, connection fine.
+    bool peer_gone() {
+        std::lock_guard<std::mutex> lk(mu);
+        if (dead) return true;
+        char probe;
+        for (;;) {
+            ssize_t n = ::recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (n == 0) { dead = true; return true; }          // FIN
+            if (n > 0)  return false;                          // pipelined bytes
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
+            dead = true;                                       // ECONNRESET etc.
+            return true;
+        }
+    }
 };
 
 inline void send_response(Conn* c, int code, const char* reason,

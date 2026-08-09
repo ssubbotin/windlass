@@ -596,11 +596,31 @@ Port the pattern from `infer.cu:2579-3400` — OpenAI-compatible `/v1/chat/compl
 
 ### Task 10: Run the PR review benchmark
 
-- [ ] Add windlass to `bench_code_review.py`'s `MODELS`, pointing at the serve endpoint.
-- [ ] Run against the three PRs it already uses.
-- [ ] Report reviews alongside the other models' output, and state the context and `max_tokens` used so the comparison is honest.
+- [x] Add windlass to `bench_code_review.py`'s `MODELS`, pointing at the serve endpoint.
+- [x] Run against the three PRs it already uses.
+- [x] Report reviews alongside the other models' output, and state the context and `max_tokens` used so the comparison is honest.
 
 **Acceptance:** windlass produces a coherent, substantive review of a real pull request — the thing it could not do before.
+
+**Met, on all three PRs.** Each review is structured to the prompt (summary, issues, suggestions, verdict), each ends on EOS rather than the token cap, and each carries file-scoped findings with a named mechanism: a division-by-zero in the Levinson-Durbin recursion when the prediction error reaches zero (`common#133`), `parseFloat("")` producing `NaN` that bypasses both branches of a validator (`webui#205`), and `m_maxQueueSize` used as a batch size with no visible initialisation plus a raw non-owning `EventLogReader*` (`backend#146`). All three verdicts are Request Changes. Reviews archived beside this plan.
+
+```
+prompt 1458/1136/1206 tokens   output 1164/907/996 tokens, all finish=stop
+prefill 9.49 / 8.99 / 9.42 tok/s      avg 9.30 — third independent reproduction of Task 4b
+decode  0.876 / 0.901 / 0.889 tok/s   avg 0.889 — 40% above Task 8's 0.637 projection
+total   24m42s / 18m54s / 20m57s      avg 21m30s
+```
+
+Decode beat the Task 8 projection because a 900–1200 token generation gives the expert cache more to reuse than the 600-token measurement did.
+
+Two defects in the harness were found by running it and are fixed in `~/boostrap-llm/bench_code_review.py`:
+
+- It passed `stream=True` to `requests` but never put `"stream": true` in the payload, so the server answered non-streaming, `iter_lines` found no `data:` prefix, and the review would have been recorded as **empty text at zero tokens**. Any streaming model scores 0 for a correct answer. This also affects the stored Qwen3.5-397B result.
+- Where the server reports real `usage`, it is now recorded next to the word count rather than replacing it, so the numbers stay comparable with results already on disk.
+
+**Do not read the `findings` column as a quality measure.** It is a line-wise keyword heuristic, so it rewards many short lines carrying file extensions. `webui#205` scored 2 while containing four issues and four suggestions, every one file-scoped. Counted by hand, all three reviews carry 8–9 substantive items. The metric is not comparable across formatting styles for any model in that table.
+
+Two honest marks against the output: on `common#133` an item about `EDR_INV_THREE` asserts integer division and then reverses itself mid-paragraph (`*Wait, 1.0 is a double...*`) — correct conclusion, reasoning left in the answer, which is the cost of `--no-think` on a budget too small for a separate trace. And the model mangled a Cyrillic JSDoc line it quoted. That second one is the model's own output: the source diff is clean UTF-8 and a Russian round-trip through the server is byte-exact.
 
 ## Constraints
 
