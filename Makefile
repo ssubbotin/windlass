@@ -19,10 +19,10 @@ CXXFLAGS ?= -O2 -std=c++17 -Wall -Wextra
 SRC      = src
 HEADERS  = $(SRC)/glm_primitives.cuh $(SRC)/glm_kernels.cuh $(SRC)/glm_loader.cuh \
            $(SRC)/glm_layer_runner.cuh $(SRC)/glm_expert_cache.cuh $(SRC)/safetensors_io.cuh \
-           $(SRC)/glm_http.cuh
+           $(SRC)/glm_http.cuh glm_sampling.cuh
 
 BINARIES = infer_glm test_glm_chain test_glm_layer test_glm_expert_cache test_glm_mxfp4 \
-           test_glm_indexer_loader test_glm_indexer test_glm_index_share test_glm_http
+           test_glm_indexer_loader test_glm_indexer test_glm_index_share test_glm_http test_glm_sampling
 
 all: infer_glm
 
@@ -49,6 +49,9 @@ test_glm_index_share: $(SRC)/test_glm_index_share.cu $(HEADERS)
 
 test_glm_mxfp4: $(SRC)/test_glm_mxfp4.cu $(SRC)/glm_kernels.cuh $(SRC)/glm_primitives.cuh
 	$(NVCC) $(CFLAGS) -I$(SRC) -o $@ $< $(LDFLAGS)
+
+test_glm_sampling: src/test_glm_sampling.cpp src/glm_sampling.cuh
+	$(CXX) $(CXXFLAGS) -Isrc -o $@ $<
 
 test_glm_http: $(SRC)/test_glm_http.cpp $(SRC)/glm_http.cuh
 	$(CXX) $(CXXFLAGS) -I$(SRC) -o $@ $< $(LDFLAGS)
