@@ -520,6 +520,7 @@ static void usage(const char* prog) {
         "       %s --model-dir DIR --packed DIR --serve [--host H] [--port P]\n"
         "          [--max-seq L] [--tokens N] [--served-model-name NAME] [--no-think]\n"
         "          [--cache-experts N] [--reserve-gb N] [--io-threads N]\n"
+        "          [--host-cache GB] [--host-cache-pin] [--o-direct]\n"
         "\n"
         "  --serve  OpenAI-compatible HTTP: POST /v1/chat/completions (with SSE when\n"
         "           the body sets \"stream\": true), GET /v1/models, GET /health.\n"
@@ -534,6 +535,9 @@ int main(int argc, char** argv) {
     uint32_t forced_cap = 0;          // --cache-experts; 0 = derive from free VRAM
     size_t   reserve_gb = 6;
     uint32_t io_threads = 4;          // --io-threads; 0 = fully synchronous fetch
+    uint32_t host_gb    = 0;          // --host-cache GB; exclusive victim slab, 0 = off
+    bool     host_pin   = false;      // --host-cache-pin; measured worthless on this box
+    bool     o_direct   = false;      // --o-direct; only correct alongside --host-cache
     int      max_seq_arg = 0;
     bool     want_timing = false, want_telemetry = false;
     bool     think = true, raw = false, ignore_eos = false;
@@ -557,6 +561,9 @@ int main(int argc, char** argv) {
         else if (a == "--cache-experts" && i + 1 < argc) forced_cap    = (uint32_t)atoi(argv[++i]);
         else if (a == "--reserve-gb"    && i + 1 < argc) reserve_gb    = (size_t)atoi(argv[++i]);
         else if (a == "--io-threads"    && i + 1 < argc) io_threads    = (uint32_t)atoi(argv[++i]);
+        else if (a == "--host-cache"    && i + 1 < argc) host_gb       = (uint32_t)atoi(argv[++i]);
+        else if (a == "--host-cache-pin")                host_pin      = true;
+        else if (a == "--o-direct")                      o_direct      = true;
         else if (a == "--max-seq"       && i + 1 < argc) max_seq_arg   = atoi(argv[++i]);
         // Task 4b's A/B. "layer" routes all prompt positions of a layer at once
         // and fetches each unique expert once; "position" is the pre-4b loop,
@@ -703,7 +710,8 @@ int main(int argc, char** argv) {
             cap, (double)cap * lay.total / 1e9, (unsigned)reserve_gb,
             cap, total_experts, 100.0 * (double)cap / (double)total_experts);
     glm::ExpertCache cache;
-    if (!cache.init(cap, packed_dir, c.dense_first, c.n_layers - c.dense_first, io_threads)) {
+    if (!cache.init(cap, packed_dir, c.dense_first, c.n_layers - c.dense_first, io_threads,
+                    host_gb, host_pin, o_direct)) {
         fprintf(stderr, "ExpertCache::init failed\n"); return 1;
     }
     size_t peak_resident = 0;
