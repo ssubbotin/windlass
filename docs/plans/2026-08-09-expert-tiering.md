@@ -208,3 +208,51 @@ already measured shut**: lossless compression (entropy 3.769/4) and cross-expert
 agreement 0.0764 against a 0.0757 chance baseline). What is NOT yet measured is lossy: a
 reduced-precision draft copy of every expert, used speculatively and verified against the full one.
 That is the only untested route to fewer bytes and it needs its own oracle before any code.
+
+## Item 4 reopened and closed: speculation economics from the measured union
+
+Speculation was the last candidate. Its cost structure is computable from numbers already measured,
+so it did not need an oracle to price. A run of k drafted tokens costs `k x draft_frac` (the draft
+passes) plus `UNION[k]` (one batched verify over the union of their experts), amortised over the
+expected number of accepted tokens. The union is the measured one: **1.70x at k=2, 2.33x at k=3,
+2.90x at k=4** on a real GLM-5.2 trace.
+
+**Lossy draft experts are dead.** Drafting with the full network at reduced precision gives, at
+*perfect* acceptance, 1.11x / 1.22x / 1.36x for 2-bit / 1.5-bit / 1-bit drafts at k=2, falling as k
+rises. Perfect acceptance from a 1-bit draft of a 3.769-bits-of-entropy payload is not a thing, and
+every cell is dominated by MTP drafting below. The route is closed, and with it the last untested
+byte-reduction lever.
+
+**MTP is viable, at k=2 only, and it is acceptance-critical.** Drafting with the checkpoint's own
+head costs one layer instead of 75:
+
+```
+                 accept=1.0   accept=0.8   accept=0.6
+  k=2  resident      1.76x        1.44x        1.15x
+  k=3  resident      1.72x        1.27x        0.93x
+  k=4  resident      1.72x        1.16x        0.80x
+```
+
+k=3 and k=4 go **below 1.0x** at 60% acceptance — speculation that loses to not speculating. Only
+k=2 stays positive across the plausible range. That inverts the usual instinct to draft further
+ahead, and it follows directly from a union cost that grows faster than linearly in k.
+
+Two prerequisites, both needing machine time: layer 78 is a full BF16 MoE layer, 18.07 GiB at
+72.3 MB per expert, **absent from the packed store**, so a repack comes first; and the acceptance
+rate is the quantity the whole thing turns on and is unmeasured on this model.
+
+## State of the improvement list
+
+```
+O_DIRECT                     DONE   +48.6%, byte-identical
+host expert slab             DONE   +3.2%, correct; family closed on fill cost
+degeneration defences        DONE   29 host checks, off by default
+popularity pinning           DEAD   monotonically harmful
+lossless byte reduction      DEAD   entropy 3.769/4, no cross-expert redundancy
+lossy draft experts          DEAD   dominated by MTP in every cell
+shared-expert / IO overlap   DEAD   0.03 ms/layer against ~13 ms of fetch
+MTP speculation at k=2       OPEN   needs a repack and an acceptance measurement
+```
+
+Everything reachable from a workstation is done. What remains needs the GPU, which is back to
+serving `vllm-service`.
