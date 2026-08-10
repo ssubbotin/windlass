@@ -1,128 +1,187 @@
 # windlass — session handoff
 
-Read this first when resuming. Written 2026-08-02, updated 2026-08-08.
+Read this first when resuming. Written 2026-08-02, rewritten 2026-08-10.
 
-> **Serve mode is verified and merged.** `task-9-verify.sh` 25 of 25 on a running server,
-> `test_glm_chain` 1.6928e-06 with top-5 exact. **Task 10 — the pull-request review — is the
-> only thing left**, and it is the point of both plans.
+> **Both plans that had tasks are finished.** Plan 1 (12 tasks) and Plan 2 (10 tasks) are complete;
+> GLM-5.2 reviews real pull requests. Plan 3 is an optimisation backlog whose every item is either
+> shipped or measured dead, except one that needs a GPU window. **Nothing is half-built and nothing
+> is unverified.** `master` is clean at `159596d`.
 
 ## Where we are in one paragraph
 
-windlass runs GLM-5.2 (753B/39B, MXFP4) on one RTX PRO 6000 by streaming routed experts from NVMe. Correctness is established from MXFP4 dequant up to the full 78-layer chain. The DSA sparse-attention indexer is implemented, so the old 2048-token cap is gone. Prefill was 44× amortised in both the CUDA engine and the numpy reference. Task 8 measured a real review at **18 min 16 s** and Task 9 built and verified an OpenAI-compatible serve mode. **Remaining work: the real pull-request review** — the thing the engine could not do before.
+windlass runs GLM-5.2 (753B/39B, MXFP4) on one RTX PRO 6000 by streaming routed experts from NVMe.
+Correctness is established from MXFP4 dequant to the full 78-layer chain, the DSA indexer is in, and
+serve mode is an OpenAI-compatible endpoint verified 25/25 on a live server. The engine **reviews
+real pull requests** — the thing it could not do before — and decode has since gone from 1.058 to
+1.623 tok/s. The remaining lever is MTP speculation at k=2, and it needs the GPU.
 
-## Repos
+## Machine state — READ THIS BEFORE ANY GPU WORK
 
-| | |
-|---|---|
-| **windlass** | `github.com/ssubbotin/windlass` — MIT, this repo, all code authored by Sergey Subbotin |
-| `~/flash-moe` | fork of `danveloper/flash-moe`, **no licence upstream** — do not copy code from it |
-| `ssubbotin/llama.cpp` @ `feature/moe-expert-gpu-cache` | MIT, the AMD hackathon deliverable, unrelated to this repo |
-| `~/boostrap-llm` | private deployment notes; holds `bench_code_review.py`, the PR review benchmark Task 10 targets |
+**`vllm-service` is UP and in real use.** Restarted 2026-08-09 22:19 UTC, `/v1/models` on :8000
+returns 200, ~90 GB of 97.9 GB resident. It serves the private PR bots. windlass cannot run alongside
+it — the expert pool alone wants 61 GB. **Ask before taking a window.** Then:
 
-windlass was clean-extracted from the flash-moe fork: every file is Sergey's, the one shared header (`kernels.cuh`, 2217 lines) was reduced to 9 needed symbols in `src/glm_primitives.cuh`, and `tools/tokenizer_server.py` was added because `infer_glm` execs it at runtime.
+```
+ssh gpu-box 'sudo systemctl stop vllm-service'
+...work...
+ssh gpu-box 'sudo systemctl start vllm-service'   # confirm :8000 /v1/models is 200
+```
 
-**Commit identity is enforced** — `.githooks/pre-commit` rejects anything but `Sergey Subbotin <ssubbotin@gmail.com>`. A fresh clone must run `git config core.hooksPath .githooks`.
+Do **not** `pkill -f infer_glm` from an ssh one-liner: the pattern matches the ssh command itself and
+kills the shell. Find the pid with `pgrep -af "infer_glm --model"` and `kill -9` it.
 
-## Machine state
-
-Everything runs on **gpu-box** (`its address`, behind a VPN). The local workstation has a 2 GB MX450 and **cannot build CUDA**.
+Everything runs on **gpu-box** (`its address`, behind a VPN). The local
+workstation has a 2 GB MX450 and **cannot build CUDA** — but see "what builds locally" below.
 
 ```
 build:     ssh gpu-box 'cd ~/windlass-build && make ARCH=sm_120 <target>'
 sync:      rsync -a --exclude '.git' --exclude 'glm-ref/' ~/windlass/ gpu-box:~/windlass-build/
 checkpoint ~/glm52-mxfp4          408 GB, 282/282 shards, byte-verified
-packed     ~/packed_experts_glm   359 GiB, 75 layers, content-verified
+packed     ~/packed_experts_glm   359 GiB, 75 layers (3..77), content-verified
 venv       ~/glm-oracle-venv/bin/python3   transformers 5.14.1
 ```
 
-**`vllm-service` is stopped** as of 2026-08-08, and the user said it is not needed back until **Monday 2026-08-10**. The GPU is free for Task 10 until then; after that, ask before taking a window. It holds 92.5 GB of 97.9 GB when up, so windlass cannot run alongside it — its expert cache alone wants 61 GB. Restart with `sudo systemctl start vllm-service` and confirm `/v1/models` on :8000 returns 200.
-
-**Expensive fixtures — do not delete:**
-
-```
-~/flash-moe/cuda_infer/glm-ref/   29-token chain fixtures, ~56 min to rebuild
-~/t6b_1400/                       1400-token reference output, ~2 h and 84 GB RSS
-~/t7_256/                         256-token all-78-layer reference, ~1 h
-glm-oracle/, glm-oracle-layer0/             single-layer transformers oracles
-```
+**Expensive fixtures — do not delete:** `~/flash-moe/cuda_infer/glm-ref/` (29-token chain
+fixtures, ~56 min to rebuild), `~/t6b_1400/`, `~/t7_256/`, `glm-oracle*/`.
+Also `/tmp/route.bin` and `/tmp/route2.bin` on the box: real expert routing traces, and the input to
+`tools/replay_expert_trace.py`. Cheap to regenerate but only with a GPU window.
 
 ## Plan progress
 
-Two plans, both under `docs/plans/`, with SDD ledgers in `.superpowers/sdd/<plan>/progress.md` (gitignored — the per-task reports live there and are the real evidence base).
+**Plan 1 — `2026-07-31-glm52-implementation-plan.md`: complete (12 tasks).**
+**Plan 2 — `2026-08-01-dsa-indexer-and-serve.md`: complete (10 tasks).** Task 10 met its acceptance.
+**Plan 3 — `2026-08-09-expert-tiering.md`: one item open, everything else shipped or dead.**
 
-**Plan 1 — `2026-07-31-glm52-implementation-plan.md`: complete (12 tasks).** Built the engine, established correctness, measured throughput. Ended at a failed 2 tok/s gate.
-
-**Plan 2 — `2026-08-01-dsa-indexer-and-serve.md`: Tasks 1–9 done, Task 10 remains.**
-
-| task | state |
-|---|---|
-| 1 spec extraction · 2 weights · 3 kernels | done |
-| 4 IndexShare + mask · **4b layer-major prefill (CUDA)** | done |
-| 5 long-context oracle · 6 indexer in numpy ref · **6b layer-major (numpy)** | done |
-| 7 full chain at long context | done |
-| **8 prefill measurement** | done — decision point answered, build serve mode |
-| **9 serve mode** | done — verified on the GPU, 25/25, merged to `master` |
-| **10 PR review benchmark** | **the only task left, and the goal** |
+```
+O_DIRECT                     DONE   +48.6%, output byte-identical
+host expert slab             DONE   +3.2%, correct; family closed on fill cost
+degeneration defences        DONE   29 host checks, off by default
+popularity pinning           DEAD   monotonically harmful, killed 3x independently
+lossless byte reduction      DEAD   entropy 3.769/4, zstd-19 = 0.8946, no redundancy
+lossy draft experts          DEAD   dominated by MTP in every cell
+shared-expert / IO overlap   DEAD   0.03 ms/layer against ~13 ms of fetch
+MTP speculation at k=2       OPEN   the only remaining lever
+```
 
 ## Key measurements
 
 ```
-correctness   chain 1.6928e-06 worst substep, top-5 exact   (short context, stable across 8 tasks)
-              single layers ≤2.2e-08 vs transformers oracle
-              indexer forced-selection 0.2–0.4 ulp vs transformers at 4096
-throughput    decode  1.227 tok/s warm (8 identical 60-token requests)
-                      0.637 tok/s on a real review (Task 8, unique 600-token completion)
-              prefill 9.41 tok/s at 1400 tokens (148.8 s) after 4b
-                      9.39 tok/s at 1464 tokens (156.0 s), cold, Task 8 — reproduces 4b
-cache         56.5% hit rate at 16.1% residency (3,094 of 19,200 experts, 62 GB)
-expert reads  840,000 → 18,917 per 1400-token prefill; 252.2/layer vs a 256 ceiling
+correctness  chain 1.6928e-06 worst substep, top-5 exact  (stable across 9 tasks)
+             single layers <=2.2e-08 vs transformers oracle
+decode       1.058 tok/s baseline -> 1.572 (--o-direct) -> 1.623 (+ --host-cache 104)
+             all three byte-identical output, 150-token paired harness
+PR review    prefill 9.30 tok/s, decode 0.889, 21m30s per review  [PRE-O_DIRECT, now stale]
+hit rate     52.7% DECODE-ONLY. The long-quoted 44% is a whole-run figure diluted by
+             an all-miss prefill; do not use it in any projection.
+NVMe         9.86 GB/s O_DIRECT 20 MB random; buffered 6.7-6.9 even with a warm cache
+H2D/D2H      pinned 50.76 / 24.87 alone; 19.61 / 19.57 CONCURRENT; pageable H2D 29.17
+host RAM     104 GB allocates and touches with zero swap-out
+union        per-layer expert union over k tokens: 1.70x k=2, 2.33x k=3, 2.90x k=4
+ceiling      Belady oracle 3.64-4.02 tok/s. Tiering cannot reach a sub-4-minute review.
 ```
-
-A PR review measures **18 min 16 s** for 600 tokens: 156 s prefill + 940 s decode. The earlier
-13-minute estimate assumed ~1 tok/s decode; the real rate on a unique long generation is 0.637.
-A complete `--no-think` review is **21–26 minutes**. With thinking ON it is 52–94 minutes, because
-600 tokens of budget buy reasoning and no review at all.
 
 ## Findings that shape what comes next
 
-**MoE routing is chaotically sensitive, so token-exact cross-implementation agreement is unachievable at depth.** Task 7 measured `1e-07 in → 2.4e-02 out`, saturating. Two experts 1.383e-05 apart at ranks 8/9 flip on floating-point noise, and ~105,000 routing decisions happen per prefill. Layers 0/2/3 agree; 40/77 diverge at 7.4e-02 for this reason, not from a defect. **Task 10 must not gate on matching another implementation.** The engine is correct; the comparison is chaotic.
+**The one open item, and why only k=2.** MTP speculation drafts with the checkpoint's own head
+(`num_nextn_predict_layers: 1`), costing one layer instead of 75. Priced against the measured union:
 
-**A `weights_proj` scale error is invisible in every output tensor** — top-k is scale-invariant. It is caught only by a separate gate on raw index scores (188×, 251×, 617× in three independent tests). Any new comparison needs both an output gate and an index-score gate; they are complementary, and neither alone catches both defect classes.
+```
+              accept=1.0   accept=0.8   accept=0.6
+  k=2             1.76x        1.44x        1.15x
+  k=3             1.72x        1.27x        0.93x
+  k=4             1.72x        1.16x        0.80x
+```
 
-**Two defects are known-undetectable and are exempted by name, not by a loosened gate**: a one-key top-k error, and `k_norm` eps 1e-6 vs 1e-5 (2.4e-03, the size of the bf16 floor).
+k>=3 falls **below 1.0x** at 60% acceptance — speculation that loses to not speculating — because the
+union cost grows faster than linearly in k. Two prerequisites: **layer 78 is a full BF16 MoE layer,
+18.07 GiB at 72.3 MB per expert, absent from the packed store**, so a repack comes first; and the
+acceptance rate is unmeasured and is what the whole thing turns on. Measure acceptance before
+building anything.
 
-**Thirteen checks that could not fail have been found in this project.** The pattern: a check whose expectation derives from the thing under test, or whose statistic is invariant to the error it targets. Every new gate gets a negative control before it is trusted. The last two both came from Task 9 and are worth reading as templates. The twelfth: a test claimed to catch a whole-body substring scan for `max_tokens`, but a JSON encoder always escapes quotes inside message content, so content can never present a bare `"max_tokens"` to any scanner — unfalsifiable in principle. The thirteenth: six `find()` calls checking the six fields of a response body all passed against a body carrying a stray quote no parser would accept, because **substring presence is invariant to anything between the substrings**. Where output is fully determined by its inputs, assert it character for character.
+**Hit rate was never the binding constraint; fill cost was.** A 40-agent invention council projected
+2.0-2.4x from a three-tier design and the real win was one `open()` flag. Its simulators ranked
+candidates on hit rate and none charged the cost of *filling* the tier. The replay I wrote to check
+them repeated the error one level down by modelling a CPU memcpy as free. Every tier variant pays
+about one expert-sized copy per fill and recovers well under half a copy per serve — the exclusive
+rule pays on PCIe, the inclusive rule pays on the CPU, and neither inverts the ratio.
+**Charge the write side of any future caching idea before believing its hit rate.**
 
-**Compilation and the host-side protocol suite together said nothing about two defects that a real server exposed in sixty seconds.** Every non-streaming response body was invalid JSON, and the stop-token set was wrong, so no completion ever ended on its own and turn scaffolding leaked into the answer. GLM-5.2 records `<|user|>` and `<|observation|>` as turn-enders **only in `generation_config.json`**; deriving stops from tokenizer metadata yields six plausible ids of which five are multimodal delimiters. Read the config. Both defects are written up in `task-9-report.md`.
+**A correct null with a wrong mechanism steered two plans.** The old headline finding said the fetch
+pipeline was "structurally shallow-queued" so faster storage could not help. The null it rested on
+was real (io_threads 4->8, +0.5%) and the mechanism was wrong: reads were buffered, and buffered
+reads cap at 6.7 GB/s even warm because each pays `copy_to_user`. That cost 48.6% sitting behind one
+flag for two plans. When a null is explained, check the explanation independently of the null.
 
-**The serve mode's protocol layer is CUDA-free on purpose.** `src/glm_http.cuh` includes no CUDA and no model type, so `make test_glm_http && ./test_glm_http` builds and runs **on the local workstation**, which cannot build CUDA at all. 98 checks, about a second. Parsing bugs no longer cost a GPU window. Keep it that way — anything added there that pulls in `cuda_runtime.h` gives that up.
+**Thirteen checks that could not fail have been found here.** Newest: six `find()` calls verified
+six fields of a JSON body and all six passed against a body carrying a stray quote no parser would
+accept — substring presence is invariant to anything *between* the substrings. Where output is fully
+determined by its inputs, assert it character for character.
 
-**The sparse regime is not yet covered end to end.** 1400 < `index_topk` = 2048, so the drop mask is still a no-op in the full chain; only Tasks 5 and 6 exercise real sparsity, at single-layer scale.
+**MoE routing is chaotically sensitive**, so token-exact cross-implementation agreement is
+unachievable at depth (`1e-07 in -> 2.4e-02 out`, saturating). Never gate on matching another
+implementation.
+
+## The gates, and which catches what
+
+```
+test_glm_chain          1.6928e-06 worst substep, top-5 exact. Arithmetic only.
+byte-identical output   ./infer_glm ... --tokens 150 --ignore-eos, stdout compared to baseline.
+                        Greedy + fixed prompt => identical bytes or something is wrong.
+```
+
+**These are complementary and the second is not optional.** The host-slab work produced three
+separate data-corruption defects that `test_glm_chain` is structurally blind to: the arithmetic was
+untouched and only the bytes fed into it were wrong. Byte-identical output caught every one, at a
+cost of one run. Any change to the fetch, cache or tier path gets both.
+
+## What builds and runs locally, with no GPU
+
+```
+make test_glm_http     && ./test_glm_http       # 98 checks, ~1 s
+make test_glm_sampling && ./test_glm_sampling   # 29 checks, ~1 s
+python3 tools/replay_expert_trace.py /tmp/route.bin 149   # needs a trace from the box
+```
+
+`src/glm_http.cuh` and `src/glm_sampling.cuh` include no CUDA and no model type **on purpose**.
+Parsing and sampling bugs produce plausible-looking wrong text rather than errors, and a GPU window
+is far too expensive a place to find them. **Keep it that way** — anything added there that pulls in
+`cuda_runtime.h` gives it up.
+
+## Serve mode
+
+```bash
+./infer_glm --model-dir ~/glm52-mxfp4 --packed ~/packed_experts_glm \
+            --serve --port 8081 --max-seq 4096 --tokens 2048 --no-think --o-direct
+```
+
+~100 s to load. `curl -s http://127.0.0.1:8081/health` -> `{"status":"ok","busy":false}`.
+Full check: `PORT=8081 bash .superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-9-verify.sh`
+(25 checks, ~4 min). The send timeout, the `peer_gone` poll and the immediate-503 threading are the
+three design points easiest to break by "simplifying"; the task-9 report gives the reasoning.
+
+`--rep-penalty` and `--degen-window` are **off by default and must stay that way** — greedy argmax
+with no penalty is the configuration every correctness result was measured under, and the
+byte-identical gate depends on it staying reachable. `test_glm_sampling` asserts that inertness.
 
 ## Next steps
 
-**Task 10 is the only remaining task.** Bringing the server up:
-
-```
-rsync -a --exclude '.git' --exclude 'glm-ref/' ~/windlass/ gpu-box:~/windlass-build/
-ssh gpu-box 'cd ~/windlass-build && make ARCH=sm_120 infer_glm'
-ssh -f gpu-box 'cd ~/windlass-build && nohup ./infer_glm \
-    --model-dir ~/glm52-mxfp4 --packed ~/packed_experts_glm \
-    --serve --port 8081 --max-seq 8192 --tokens 2048 --no-think > /tmp/serve.log 2>&1 </dev/null &'
-# ~100 s to load. Confirm: curl -s http://127.0.0.1:8081/health  -> {"status":"ok","busy":false}
-```
-
-Re-run `PORT=8081 bash .superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-9-verify.sh` after
-any change to the serving path — it is 25 checks and about four minutes. The send timeout and the
-immediate-503 threading are the two design points easy to break by "simplifying"; the task report
-gives the reasoning for each.
-
-**The review itself.** Add windlass to `~/boostrap-llm/bench_code_review.py`'s `MODELS`, pointing at `http://its address:8081/v1/chat/completions`. Set `"streaming": True` (the benchmark already supports it, and it is what survives a 156 s prefill) and `"timeout": 3600` — the default 120 s is far short of the 21–26 minutes a review takes. Run the server with `--no-think`: with thinking on, the budget goes entirely to reasoning and no review is produced. State the context, `max_tokens`, the no-think choice and that sampling is greedy, since the other models run `max_tokens: 16384` unconstrained. Judge on quality; do **not** gate on token agreement.
+1. **Re-run the three-PR benchmark.** The recorded 21m30s per review predates O_DIRECT, so the
+   headline review time is stale by roughly a third. Output is byte-identical, so quality is
+   unchanged and only the timings need refreshing. `~/boostrap-llm/bench_code_review.py`,
+   `BENCH_ONLY=windlass`. Needs a GPU window.
+2. **MTP: measure acceptance first, build second.** Repack layer 78, then measure the k=2 acceptance
+   rate. Below ~0.6 the whole lever is worthless; above ~0.8 it is worth 1.44x.
+3. **A fairness correction is outstanding.** Task 10 compares against a stored Qwen3.5-397B result
+   that is degenerate word salad, and that run predates the sampling fixes the same engine later
+   gained. windlass cleared a lower bar than the write-up claims. Re-running that model with
+   sampling enabled would settle it, and Plan 3 already says so.
 
 ## How to resume
 
-The work uses `superpowers:subagent-driven-development` where subagents are available: one implementer per task, a review after each, findings recorded in the ledger. Every dispatch should carry the constraints the prior tasks measured — that is what has kept defects out of committed code.
+Plan 2 used `superpowers:subagent-driven-development` with per-task reports in
+`.superpowers/sdd/<plan>/` (gitignored — that directory is the real evidence base). Task briefs are
+written by hand; there is no `scripts/` directory in this repo.
 
-Task briefs are written by hand into the ledger directory (`task-N-brief.md`); earlier notes referred to a `scripts/task-brief` generator, but **no `scripts/` directory exists in this repo** and the briefs from Tasks 2–7 were all written directly.
-
-The regression gate for every task in plan 2 is `test_glm_chain` reporting **1.6928e-06 and top-5 exact** at short context. It has not moved in eight tasks; any movement means something reached into the existing forward path.
+**Commit identity is enforced** — `.githooks/pre-commit` rejects anything but
+`Sergey Subbotin <ssubbotin@gmail.com>`. A fresh clone must run `git config core.hooksPath .githooks`.
+`~/flash-moe` has **no upstream licence**: read it for measurements, never copy code from it.
