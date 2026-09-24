@@ -32,3 +32,6 @@ venv/
 .DS_Store
 *.swp
 .superpowers/
+
+# Machine-specific notes; never commit (the repository is public)
+CLAUDE.local.md

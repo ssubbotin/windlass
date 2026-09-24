@@ -147,7 +147,7 @@ static std::string g_worst_tag = "(none)";
 //
 // IT CAN FAIL, and the authoritative evidence for that is not the in-test
 // controls below but four defects injected into GLM_KERNELS.CUH ITSELF, built
-// and run on gpu-box (task-3-report.md). Each produced exit 1:
+// and run on the GPU box (task-3-report.md). Each produced exit 1:
 //
 //   RMSNorm for LayerNorm          k        1.05e-01   1.1e+04x this gate
 //   RoPE on the trailing 64        k        1.64e+00   1.6e+05x

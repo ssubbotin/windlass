@@ -17,34 +17,24 @@ real pull requests** — the thing it could not do before — and decode has sin
 
 ## Machine state — READ THIS BEFORE ANY GPU WORK
 
-**`vllm-service` is UP and in real use.** Restarted 2026-08-09 22:19 UTC, `/v1/models` on :8000
-returns 200, ~90 GB of 97.9 GB resident. It serves the private PR bots. windlass cannot run alongside
-it — the expert pool alone wants 61 GB. **Ask before taking a window.** Then:
+This repository is public. Host names, addresses, remote paths and the service that shares the GPU
+are kept in **`CLAUDE.local.md`** (untracked). Read it before any GPU work, and never copy its
+contents into a tracked file.
 
-```
-ssh gpu-box 'sudo systemctl stop vllm-service'
-...work...
-ssh gpu-box 'sudo systemctl start vllm-service'   # confirm :8000 /v1/models is 200
-```
+**The GPU is shared with a vLLM service that is in real use.** windlass cannot run alongside it —
+the expert pool alone wants 61 GB. **Ask before taking a window**, stop the service for the window,
+restart it afterwards and confirm it serves.
 
 Do **not** `pkill -f infer_glm` from an ssh one-liner: the pattern matches the ssh command itself and
 kills the shell. Find the pid with `pgrep -af "infer_glm --model"` and `kill -9` it.
 
-Everything runs on **gpu-box** (`its address`, behind a VPN). The local
-workstation has a 2 GB MX450 and **cannot build CUDA** — but see "what builds locally" below.
+Everything runs on the GPU box. The local workstation has a 2 GB MX450 and **cannot build CUDA** —
+but see "what builds locally" below.
 
-```
-build:     ssh gpu-box 'cd ~/windlass-build && make ARCH=sm_120 <target>'
-sync:      rsync -a --exclude '.git' --exclude 'glm-ref/' ~/windlass/ gpu-box:~/windlass-build/
-checkpoint ~/glm52-mxfp4          408 GB, 282/282 shards, byte-verified
-packed     ~/packed_experts_glm   359 GiB, 75 layers (3..77), content-verified
-venv       ~/glm-oracle-venv/bin/python3   transformers 5.14.1
-```
-
-**Expensive fixtures — do not delete:** `~/flash-moe/cuda_infer/glm-ref/` (29-token chain
-fixtures, ~56 min to rebuild), `~/t6b_1400/`, `~/t7_256/`, `glm-oracle*/`.
-Also `/tmp/route.bin` and `/tmp/route2.bin` on the box: real expert routing traces, and the input to
-`tools/replay_expert_trace.py`. Cheap to regenerate but only with a GPU window.
+**Expensive fixtures on the box — do not delete:** the `glm-ref/` chain fixtures (~56 min to
+rebuild), `t6b_1400/`, `t7_256/`, `glm-oracle*/`. Also two real expert routing traces in `/tmp`, the
+input to `tools/replay_expert_trace.py`. Cheap to regenerate but only with a GPU window. Paths are in
+`CLAUDE.local.md`.
 
 ## Plan progress
 
@@ -150,7 +140,7 @@ is far too expensive a place to find them. **Keep it that way** — anything add
 ## Serve mode
 
 ```bash
-./infer_glm --model-dir ~/glm52-mxfp4 --packed ~/packed_experts_glm \
+./infer_glm --model-dir ./glm52-mxfp4 --packed ./packed_experts \
             --serve --port 8081 --max-seq 4096 --tokens 2048 --no-think --o-direct
 ```
 

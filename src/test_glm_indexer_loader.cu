@@ -16,7 +16,7 @@
  *      own tensor headers (independent of load_layer's internal asserts).
  *
  * Build: make test_glm_indexer_loader
- * Run:   ./test_glm_indexer_loader --model-dir ~/glm52-mxfp4
+ * Run:   ./test_glm_indexer_loader --model-dir ./glm52-mxfp4
  */
 #include <cstdio>
 #include <cstdlib>

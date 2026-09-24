@@ -78,8 +78,8 @@ static void test_degeneration() {
         d.observe(std::string(64, '\x01'));
         check(d.degenerate(), "a window with no letters fires");
     }
-    {   // NEGATIVE CONTROL, and the one that matters most operationally. private
-        // is a Russian codebase and reviews of it are mostly Cyrillic, which is
+    {   // NEGATIVE CONTROL, and the one that matters most operationally. The
+        // review target is a Russian codebase; its reviews are mostly Cyrillic, which is
         // multi-byte UTF-8 with the high bit set. An ASCII-only letter test
         // scores such a review at 0.0 letters and kills it on the first
         // sentence — a detector that destroys the primary use case.

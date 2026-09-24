@@ -255,4 +255,4 @@ MTP speculation at k=2       OPEN   needs a repack and an acceptance measurement
 ```
 
 Everything reachable from a workstation is done. What remains needs the GPU, which is back to
-serving `vllm-service`.
+serving the vLLM service that shares it.

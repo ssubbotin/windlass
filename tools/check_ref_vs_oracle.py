@@ -35,7 +35,7 @@ enough for this script):
   python3 check_ref_vs_oracle.py \
       --model ./glm52-mxfp4 --packed ./packed_experts \
       --oracle-layer0 glm-oracle-layer0 --oracle-layer3 glm-oracle
-  ... --oracle-long ~/glm-oracle-t5   # + the indexer, at seq 4096
+  ... --oracle-long glm-oracle-t5   # + the indexer, at seq 4096
   ... --negative-controls      # additionally re-demonstrate that it can fail
 
 Exits 0 if every assertion passes, 1 otherwise.

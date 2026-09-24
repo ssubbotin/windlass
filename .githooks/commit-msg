@@ -1,0 +1,3 @@
+#!/bin/sh
+# Reject commit messages that name private infrastructure (see leak-check.sh).
+exec "$(git rev-parse --show-toplevel)/.githooks/leak-check.sh" message "$1"

@@ -16,3 +16,6 @@ if [ "$EMAIL" != "$WANT_EMAIL" ] || [ "$NAME" != "$WANT_NAME" ]; then
   echo "                      git config user.email \"$WANT_EMAIL\"" >&2
   exit 1
 fi
+
+# Reject staged content that names private infrastructure (see leak-check.sh).
+"$(git rev-parse --show-toplevel)/.githooks/leak-check.sh" files || exit 1

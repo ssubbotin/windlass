@@ -47,7 +47,7 @@ Above 2048, `dump_glm_oracle.py` builds a real `GlmMoeDsaDecoderLayer` from chec
 `site-packages/transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py` (809 lines; generated from
 `modular_glm_moe_dsa.py`, which is not what runs). Citations below are `modeling_glm_moe_dsa.py:LINE`
 unless stated otherwise. Shapes and dtypes cross-checked against the live checkpoint
-(`~/glm52-mxfp4/model.safetensors.index.json`); the ≤`index_topk` equivalence claim was
+(`glm52-mxfp4/model.safetensors.index.json`); the ≤`index_topk` equivalence claim was
 verified by executing the real `GlmMoeDsaIndexer` class, not by reading alone.
 
 #### Answers
@@ -545,7 +545,7 @@ See `.superpowers/sdd/2026-08-01-dsa-indexer-and-serve/task-6b-report.md`.
 ### Task 7: Full chain at long context
 
 - [x] Regenerate fixtures with a ~1400-token real prompt (a PR diff plus review instructions).
-  **Task 6b's `~/t6b_1400/` reused as-is** — it is that prompt, at 2 h and 84 GB a
+  **Task 6b's `t6b_1400/` reused as-is** — it is that prompt, at 2 h and 84 GB a
   run. One new reference was generated at 256 tokens with all 78 layers dumped, to bisect the
   disagreement below.
 - [x] Per-substep gating at layers 0/2/3/40/77 — note **layer 2 is added** because it is an indexer owner.
@@ -577,7 +577,7 @@ regression unmoved: `1.6928e-06`, top-5 exact at all 5 tokens.
 
 **This decides whether the serve mode is worth building.** If a review costs 8 minutes, windlass is usable for batch work; at 40 minutes it is a demonstration. Report the number before proceeding.
 
-**Answered: build it.** On the real `bench_code_review.py` prompt for `a private pull request` (1464 tokens), prefill is **155.99 s — 9.39 tok/s**, reproducing Task 4b within 0.2%, and 600 tokens decode in **939.79 s — 0.637 tok/s**, for **18 min 16 s** total. A complete `--no-think` review is ~21–26 min. Decode is 1.93× below the 1.227 tok/s in RESULTS.md because that figure is eight identical 60-token requests replaying the same experts; a unique long generation plateaus at 44.2% cache hit rate rather than 56.5%. Two constraints follow: 600 tokens with thinking ON yields **no review at all** (the budget goes entirely to reasoning), so Task 10 runs `--no-think` and discloses it; and a request occupies the connection for 20+ minutes, so Task 9's SSE keepalive is load-bearing rather than cosmetic.
+**Answered: build it.** On the real `bench_code_review.py` prompt for a real private pull request (1464 tokens), prefill is **155.99 s — 9.39 tok/s**, reproducing Task 4b within 0.2%, and 600 tokens decode in **939.79 s — 0.637 tok/s**, for **18 min 16 s** total. A complete `--no-think` review is ~21–26 min. Decode is 1.93× below the 1.227 tok/s in RESULTS.md because that figure is eight identical 60-token requests replaying the same experts; a unique long generation plateaus at 44.2% cache hit rate rather than 56.5%. Two constraints follow: 600 tokens with thinking ON yields **no review at all** (the budget goes entirely to reasoning), so Task 10 runs `--no-think` and discloses it; and a request occupies the connection for 20+ minutes, so Task 9's SSE keepalive is load-bearing rather than cosmetic.
 
 ---
 
@@ -627,5 +627,5 @@ Two honest marks against the output: on `common#133` an item about `EDR_INV_THRE
 - No `printf` in device kernels — corrupts output on SM 12.0.
 - Do not modify existing arithmetic outside the indexer path; `test_glm_chain` must still show top-5 exact and worst substep ≤1e-5 at short context after every change.
 - Model weights, packed experts and `glm-ref/` are never deleted.
-- `vllm-service` may be stopped for GPU work; restart it immediately after, and confirm it serves.
+- The vLLM service sharing the GPU may be stopped for GPU work; restart it immediately after, and confirm it serves.
 - Commits carry no AI attribution and no co-author trailer.

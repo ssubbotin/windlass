@@ -570,7 +570,7 @@ int main(int argc, char** argv) {
     bool     think = true, raw = false, ignore_eos = false;
     bool     want_serve = false;
     std::string serve_host = "0.0.0.0", served_name = "windlass-glm52";
-    int      serve_port = 8081;       // 8000 is where vllm-service lives on this box
+    int      serve_port = 8081;       // 8000 is taken by the vLLM service sharing the GPU
     bool     n_gen_set = false;
 
     for (int i = 1; i < argc; i++) {
