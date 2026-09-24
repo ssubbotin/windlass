@@ -2,6 +2,8 @@
 
 All figures from a single machine: RTX PRO 6000 Blackwell (96 GB, SM 12.0), 125 GB system RAM, Samsung 9100 PRO 4 TB NVMe (PCIe 5.0), CUDA 13.1. Model is GLM-5.2 at MXFP4 (`amd/GLM-5.2-MXFP4`), 753B total / 39B active.
 
+**The throughput figures here predate `O_DIRECT`.** Plan 3 ([docs/plans/2026-08-09-expert-tiering.md](plans/2026-08-09-expert-tiering.md)) took decode from 1.058 to 1.572 tok/s with `--o-direct` and to 1.623 with `--host-cache 104`, on a 150-token same-prompt harness with byte-identical output, and it overturned two conclusions below. Each is marked where it appears; the measurements themselves stand.
+
 ## Memory budget, measured not estimated
 
 The checkpoint's 438 GB partitions as:
@@ -87,7 +89,7 @@ total   1095.78 s = 18 min 16 s
 
 Prefill reproduces the layer-major figure to within 0.2%, from a **fully cold** cache (`hits=0 misses=18992`, 253.2 fetches per MoE layer against a 256 ceiling), so that amortisation does not depend on a warm pool. Decode is 1.93× lower than the headline. It is not a regression and not a cold-start transient: the per-interval hit rate falls from 60.1% and then plateaus around 44%, never trending upward, with the pool full for the entire run (3047/3047, 208,042 evictions against 211,089 misses, 15.9% residency). Decode fetches exactly 600 experts per step — 75 MoE layers × 8, one position, nothing to amortise. Attention rises from 1.5% to 8.8% of layer time at this context; expert fetch is still 84.2%.
 
-Quote 1.227 for the optimisation deltas it was measured against. Quote **0.637** for what a user waits through.
+Quote 1.227 for the optimisation deltas it was measured against. Quote **0.637** for what a user waited through before `O_DIRECT`; this workload has not been re-run since.
 
 ### Measurement discipline
 
@@ -120,6 +122,8 @@ The ranking is the opposite of the intuitive one. Pinned staging was expected to
 
 ## Why it stops here
 
+> **Superseded (Plan 3).** The fetch-path conclusion below has the mechanism wrong. The device ceiling has since been measured: 20 MB random reads saturate the NVMe at low queue depth (8.78 GB/s at depth 1, 9.86 GB/s at best), so a deeper queue had little to gain. What bound the path was buffered reads, capped at 6.7 GB/s even with a warm page cache because every read pays `copy_to_user`; `O_DIRECT` removed that for +48.6%. The hit-rate question left open here was also taken up: on a real routing trace, static popularity pinning and per-layer partitioning both do worse than global LRU, and a Belady oracle (which needs future knowledge) caps any caching policy at 3.64–4.02 tok/s.
+
 Two independent ceilings.
 
 **The cache hit rate plateaus at 56.5%** — reached by request 2, with no warm-up curve (1.6% improvement across 8 requests). For comparison, a 397B model on a 24 GB card reached ~95% at 8% residency. Whether this is diffuse routing or the wrong eviction policy is **not established**: no residency sweep, no LRU/LFU/Belady comparison, and no access-trace analysis were run. The observation is solid; the causal attribution is not.
@@ -129,6 +133,8 @@ Two independent ceilings.
 Note the device ceiling itself was **never measured** — no `fio`, no `iostat`, and GPUDirect Storage was not tried (it bypasses the page cache, which serves roughly a third of this pool). Achieved throughput was 6.42 GB/s against the 10.47 GB/s that 2 tok/s would require. "The SSD is saturated" would be a claim beyond the evidence; "the pipeline cannot queue deeply enough to saturate it" is what the data supports.
 
 ## Independent corroboration
+
+> **Superseded.** The agreement at 1.23 tok/s turned out to be a shared unoptimised data path, not a limit of the technique: with `O_DIRECT` this engine measures 1.572–1.623 tok/s (on its own 150-token harness, so not a like-for-like comparison with Colibri's figure).
 
 [Colibri](https://github.com/uv-genai/colibri) — pure C, CPU-first, same model, same technique, different architecture entirely — reports **0.05–1.23 tok/s**, peak 1.23 on AVX-512 with PCIe Gen5 storage. This engine measures **1.227 tok/s**.
 

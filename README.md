@@ -20,8 +20,8 @@ Correctness is established. Throughput is not competitive, and the measurements 
 |---|---|
 | Correctness | top-5 token ids exact vs. a numpy reference; worst substep **1.69e-06** against a derived 1e-5 gate |
 | Single layers | **≤2.2e-08** against a `transformers` oracle |
-| Throughput | **1.227 tok/s** warm (RTX PRO 6000 Blackwell, Samsung 9100 PRO) |
-| Expert-cache hit rate | **56.5%** at 16.1% residency |
+| Throughput | **1.623 tok/s** decode with `--o-direct --host-cache 104`, 1.058 with neither (150-token same-prompt harness; RTX PRO 6000 Blackwell, Samsung 9100 PRO) |
+| Expert-cache hit rate | **52.7%** during decode, at ~16% residency |
 
 See [docs/RESULTS.md](docs/RESULTS.md) for the full measurements, the negative controls, and the throughput analysis.
 
@@ -33,19 +33,23 @@ The point of the engine. Three real PRs from a working Gitea instance, reviewed 
 prefill 9.30 tok/s   decode 0.889 tok/s   21m30s per review, all three ending on EOS
 ```
 
+Those timings predate `--o-direct`. Output has stayed byte-identical since, so the reviews are unchanged; a re-run for the timings is pending.
+
 Each review is structured to the prompt and file-scoped. On a C++ Levinson-Durbin solver it identified a division by zero when the prediction error reaches zero, with the trigger condition and a fix; on a TypeScript player it traced `parseFloat("")` → `NaN` through both branches of a validator to show the fallback is bypassed. Twenty minutes a review is a nightly-batch tool, not an interactive one.
 
 ## The finding
 
-Expert fetch is **87.6% of layer time**, and the bottleneck is a host memory copy rather than the SSD.
+Expert fetch was **87.6% of layer time**, and the bottleneck was a host memory copy rather than the SSD.
 
-Measured on the device and the real packed files: NVMe random reads of the 20 MB expert stride reach **8.78 GB/s at queue depth 1** and 9.26 GB/s at QD 4, with latency scaling linearly past that — the device saturates at depth 1. But the fetch path opens with plain `O_RDONLY`, and **buffered reads measure 6.7 GB/s even with the page cache warm**, because every read pays `copy_to_user`. Effective decode rate works out to 6.0 GB/s: 336 misses × 20.05 MB ÷ 1.125 s per token, predicting 1006 ms of fetch against 985 ms measured.
+Measured on the device and the real packed files: NVMe random reads of the 20 MB expert stride reach **8.78 GB/s at queue depth 1** and 9.26 GB/s at QD 4, with latency scaling linearly past that — the device saturates at depth 1. But the fetch path opened with plain `O_RDONLY`, and **buffered reads measure 6.7 GB/s even with the page cache warm**, because every read pays `copy_to_user`. Effective decode rate worked out to 6.0 GB/s: 336 misses × 20.05 MB ÷ 1.125 s per token, predicting 1006 ms of fetch against 985 ms measured.
 
-So the engine sits on the buffered-read ceiling, 35% below what the storage already delivers, while the GPU is idle 96.5% of the time and host-to-device runs at **49.4 GB/s from pinned memory** — 5.3× the SSD, and never used as a cache tier.
+**Opening the expert store with `O_DIRECT` took decode from 1.058 to 1.572 tok/s, +48.6%, with byte-identical output.** The store needed no restructuring: an expert is 20,054,016 bytes, exactly 4896 × 4096, so every read is already aligned.
+
+The next tier down gave much less. A host-RAM slab filled from the pinned staging buffer the bytes already pass through (`--host-cache 104`) serves 29.9% of GPU misses and adds **+3.2%**, to 1.623 tok/s. Every fill costs about one expert-sized copy and each serve recovers well under half of one, so hit rate was never the binding constraint: fill cost was. A Belady oracle on a real routing trace puts the ceiling for any caching policy at 3.64–4.02 tok/s.
 
 An earlier version of this section argued the pipeline was *structurally shallow-queued*: expert selection is data-dependent per layer, so a decode step never has more than 8 — mean 3.5 — reads in flight. The shallow queue is real, and it is not what binds. The 4→8 io-thread null (+0.5%) was read as "nothing left to issue" when it means "the device was already full at 1."
 
-An independent implementation, [Colibri](https://github.com/uv-genai/colibri) (pure C, CPU-first), reports **1.23 tok/s** peak on GLM-5.2, against 1.227 here. That was read as two implementations converging on a limit belonging to the technique. A GPU engine tying a CPU engine on a pure data-movement problem is better evidence of an unoptimised data path.
+An independent implementation, [Colibri](https://github.com/uv-genai/colibri) (pure C, CPU-first), reports **1.23 tok/s** peak on GLM-5.2, against 1.227 here before `O_DIRECT`. That was read as two implementations converging on a limit belonging to the technique. A GPU engine tying a CPU engine on a pure data-movement problem was better evidence of an unoptimised data path, and the `O_DIRECT` result bears that out.
 
 ## Build
 
@@ -70,16 +74,16 @@ python3 tools/repack_experts_glm.py --model ./glm52-mxfp4 --out ./packed_experts
 
 # 4. Generate
 ./infer_glm --model-dir ./glm52-mxfp4 --packed ./packed_experts \
-            --prompt "def quicksort(arr):" --tokens 40 --io-threads 4
+            --prompt "def quicksort(arr):" --tokens 40 --o-direct --host-cache 104
 ```
 
-`--io-threads` selects the fetch strategy: `0` pinned staging only, `1` double-buffered overlap, `4` batched issue (best measured). Beyond 4 there is nothing left to overlap.
+`--o-direct` reads the expert store past the page cache (+48.6%). `--host-cache GB` adds a host-RAM expert tier (+3.2% at 104 GB) and needs that much free RAM. Both are off by default. `--io-threads` selects the fetch strategy: `0` pinned staging only, `1` double-buffered overlap, `4` batched issue (the default, and best measured; 8 measured +0.5%, within noise).
 
 ### Serving
 
 ```bash
 ./infer_glm --model-dir ./glm52-mxfp4 --packed ./packed_experts \
-            --serve --port 8081 --max-seq 8192 --tokens 600 --no-think
+            --serve --port 8081 --max-seq 8192 --tokens 600 --no-think --o-direct
 ```
 
 An OpenAI-compatible endpoint: `POST /v1/chat/completions` (add `"stream": true` for SSE), `GET /v1/models`, `GET /health`. One request at a time — a second concurrent request gets `503` rather than queueing behind a generation that runs for tens of minutes. A request whose prompt plus `max_tokens` exceeds `--max-seq` is refused with a `400` naming all three numbers, since truncating to fit would answer a prompt the caller did not send.
@@ -111,7 +115,7 @@ One of those deserves emphasis: **the LoRA-epsilon defect produced the exactly c
 
 ## Scope and limits
 
-- **Long-context arithmetic is validated one layer at a time, not end to end.** GLM-5.2's DSA sparse-attention indexer is implemented and wired into attention, so the old `index_topk` (2048-token) abort is gone. Below `index_topk` the top-k selects every key, the index mask is a no-op, and the sparse path is *bit-identical* to the dense one — asserted in `test_glm_layer`. Above it, at 4096 tokens, `test_glm_layer` compares an indexer-owning layer and a consuming layer against a `transformers` oracle: with the oracle's key selection forced in, every substep agrees to the bf16 fixture floor (worst 0.83 bf16 ulp of its own scale); with the CUDA indexer choosing, the two agree on 2043 of 2048 keys and the worst substep is 10.05 ulp. The measured limits are recorded honestly: the test detects a selection error of ≳8 keys in 2048 but not 1, and it cannot see a `k_norm` eps of 1e-5 instead of 1e-6 (2.4e-03 on index scores, the same size as the bf16 floor). The full **chain** above 2048 still has no oracle — `ref_glm_chain.py` carries the same 2048 limit.
+- **Long-context arithmetic is validated one layer at a time, not end to end.** GLM-5.2's DSA sparse-attention indexer is implemented and wired into attention, so the old `index_topk` (2048-token) abort is gone. Below `index_topk` the top-k selects every key, the index mask is a no-op, and the sparse path is *bit-identical* to the dense one — asserted in `test_glm_layer`. Above it, at 4096 tokens, `test_glm_layer` compares an indexer-owning layer and a consuming layer against a `transformers` oracle: with the oracle's key selection forced in, every substep agrees to the bf16 fixture floor (worst 0.83 bf16 ulp of its own scale); with the CUDA indexer choosing, the two agree on 2043 of 2048 keys and the worst substep is 10.05 ulp. The measured limits are recorded honestly: the test detects a selection error of ≳8 keys in 2048 but not 1, and it cannot see a `k_norm` eps of 1e-5 instead of 1e-6 (2.4e-03 on index scores, the same size as the bf16 floor). The full **chain** above 2048 has not been compared. The numpy reference now runs there, but the chain is chaotic at that length (1e-07 in, 2.4e-02 out, saturating), so a meaningful comparison first needs the CUDA chain forced onto the reference's key selections at every layer.
 - Single GPU. No tensor/pipeline parallelism.
 - Greedy decode. No batching. The serving endpoint handles one request at a time.
 - One model family so far.

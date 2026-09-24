@@ -1,11 +1,11 @@
 # windlass — session handoff
 
-Read this first when resuming. Written 2026-08-02, rewritten 2026-08-10.
+Read this first when resuming. Written 2026-08-02, rewritten 2026-08-10, revised 2026-09-24.
 
 > **Both plans that had tasks are finished.** Plan 1 (12 tasks) and Plan 2 (10 tasks) are complete;
 > GLM-5.2 reviews real pull requests. Plan 3 is an optimisation backlog whose every item is either
-> shipped or measured dead, except one that needs a GPU window. **Nothing is half-built and nothing
-> is unverified.** `master` is clean at `159596d`.
+> shipped or measured dead, except MTP speculation, which a 2026-09-24 review re-priced from 1.44x to
+> about 1.06x. **Nothing is half-built and nothing is unverified.** `master` is clean.
 
 ## Where we are in one paragraph
 
@@ -13,7 +13,9 @@ windlass runs GLM-5.2 (753B/39B, MXFP4) on one RTX PRO 6000 by streaming routed 
 Correctness is established from MXFP4 dequant to the full 78-layer chain, the DSA indexer is in, and
 serve mode is an OpenAI-compatible endpoint verified 25/25 on a live server. The engine **reviews
 real pull requests** — the thing it could not do before — and decode has since gone from 1.058 to
-1.623 tok/s. The remaining lever is MTP speculation at k=2, and it needs the GPU.
+1.623 tok/s. MTP speculation was the last open lever and is now priced at ~5% of decode unless its
+acceptance measures 0.9 or better. What is left is one GPU window of measurements, then a decision:
+prefill compute, MTP at k=1, or product work on a finished engine (see Next steps).
 
 ## Machine state — READ THIS BEFORE ANY GPU WORK
 
@@ -50,7 +52,7 @@ popularity pinning           DEAD   monotonically harmful, killed 3x independent
 lossless byte reduction      DEAD   entropy 3.769/4, zstd-19 = 0.8946, no redundancy
 lossy draft experts          DEAD   dominated by MTP in every cell
 shared-expert / IO overlap   DEAD   0.03 ms/layer against ~13 ms of fetch
-MTP speculation at k=2       OPEN   the only remaining lever
+MTP speculation              OPEN   re-priced: ceiling 1.18x at k=1; worth it only at acceptance >= 0.9
 ```
 
 ## Key measurements
@@ -66,27 +68,37 @@ hit rate     52.7% DECODE-ONLY. The long-quoted 44% is a whole-run figure dilute
 NVMe         9.86 GB/s O_DIRECT 20 MB random; buffered 6.7-6.9 even with a warm cache
 H2D/D2H      pinned 50.76 / 24.87 alone; 19.61 / 19.57 CONCURRENT; pageable H2D 29.17
 host RAM     104 GB allocates and touches with zero swap-out
-union        per-layer expert union over k tokens: 1.70x k=2, 2.33x k=3, 2.90x k=4
+union        per-layer expert union over n tokens: 1.70x n=2, 2.33x n=3, 2.90x n=4
+             => any speculation is capped at n/UNION[n]: 1.18x / 1.29x / 1.38x
 ceiling      Belady oracle 3.64-4.02 tok/s. Tiering cannot reach a sub-4-minute review.
 ```
 
 ## Findings that shape what comes next
 
-**The one open item, and why only k=2.** MTP speculation drafts with the checkpoint's own head
-(`num_nextn_predict_layers: 1`), costing one layer instead of 75. Priced against the measured union:
+**The one open item is worth about 5%, not 1.44x.** MTP speculation drafts with the checkpoint's own
+head (`num_nextn_predict_layers: 1`). Plan 3 priced it at 1.44x for k=2 at 0.8 acceptance, but its
+table credited k+1 tokens while charging the expert union of only k positions. A verify step commits
+at most one token per forwarded position, and k drafts forward k+1 positions. Charged correctly, with
+the draft free:
 
 ```
-              accept=1.0   accept=0.8   accept=0.6
-  k=2             1.76x        1.44x        1.15x
-  k=3             1.72x        1.27x        0.93x
-  k=4             1.72x        1.16x        0.80x
+drafts  positions   accept=1.0   accept=0.8   accept=0.6
+k=1         2           1.18x        1.06x        0.94x
+k=2         3           1.29x        1.05x        0.84x
+k=3         4           1.38x        1.02x        0.75x
 ```
 
-k>=3 falls **below 1.0x** at 60% acceptance — speculation that loses to not speculating — because the
-union cost grows faster than linearly in k. Two prerequisites: **layer 78 is a full BF16 MoE layer,
-18.07 GiB at 72.3 MB per expert, absent from the packed store**, so a repack comes first; and the
-acceptance rate is unmeasured and is what the whole thing turns on. Measure acceptance before
-building anything.
+The draft is not free either: resident, layer 78 takes 18.07 GiB (~30%) out of the expert pool;
+streamed, each draft fetches eight BF16 experts at 3.6x the bytes of an MXFP4 one. Neither cost is
+priced yet. Build it only if acceptance measures 0.9 or better, and then at k=1. The full correction
+is in Plan 3.
+
+**Prefill may now be compute-bound, and nobody has priced it.** Task 4b: going from 256 to 1400
+tokens added 14% more fetches but 75 s more prefill (73.5 -> 148.8 s). The extra fetches explain
+about 10 s; the rest grows with token count. With O_DIRECT the fetch floor for a whole-store prefill
+is ~38 s (379 GB at 9.86 GB/s). This is an inference from two runs, not a measurement; one `--timing`
+prefill settles it. If it holds, larger PRs make it worse, and the batched expert matvecs are a
+candidate for tensor cores.
 
 **Hit rate was never the binding constraint; fill cost was.** A 40-agent invention council projected
 2.0-2.4x from a three-tier design and the real win was one `open()` flag. Its simulators ranked
@@ -155,13 +167,22 @@ byte-identical gate depends on it staying reachable. `test_glm_sampling` asserts
 
 ## Next steps
 
-1. **Re-run the three-PR benchmark.** The recorded 21m30s per review predates O_DIRECT, so the
-   headline review time is stale by roughly a third. Output is byte-identical, so quality is
-   unchanged and only the timings need refreshing. `~/boostrap-llm/bench_code_review.py`,
-   `BENCH_ONLY=windlass`. Needs a GPU window.
-2. **MTP: measure acceptance first, build second.** Repack layer 78, then measure the k=2 acceptance
-   rate. Below ~0.6 the whole lever is worthless; above ~0.8 it is worth 1.44x.
-3. **A fairness correction is outstanding.** Task 10 compares against a stored Qwen3.5-397B result
+1. **One GPU window, three measurements.** Ask first; the vLLM service has to stop for it.
+   - **Re-run the three-PR benchmark** with `--o-direct --host-cache 104`. The recorded 21m30s per
+     review predates O_DIRECT. Output is byte-identical, so only the timings need refreshing.
+     `~/boostrap-llm/bench_code_review.py`, `BENCH_ONLY=windlass`.
+   - **Prefill with `--timing`** on the same prompt: fetch against compute after O_DIRECT.
+   - **Dump the main model's final hidden states** over one review, so MTP acceptance can be
+     measured offline on the box's CPU, without the 18 GiB repack. Before building the dump, check
+     that a reference for the GLM MTP head exists: transformers often skips those weights.
+2. **Decide from the numbers.** Prefill compute-bound: batched expert matvecs onto tensor cores.
+   Acceptance >= 0.9: MTP at k=1. Otherwise the throughput work is done.
+3. **Product gaps for the PR-review use**, ranked above MTP: the benchmark review already runs past
+   `index_topk` (1464 prompt + 600 generated = 2064 tokens), a range validated one layer at a time:
+   no full-chain comparison above 2048 exists, and Task 7 says one needs a forced-selection pass
+   because the chain is chaotic at that length; the think budget Plan 3 calls strictly better than `--no-think` is not
+   built; and a nightly batch needs a regular GPU window shared with the vLLM service.
+4. **A fairness correction is outstanding.** Task 10 compares against a stored Qwen3.5-397B result
    that is degenerate word salad, and that run predates the sampling fixes the same engine later
    gained. windlass cleared a lower bar than the write-up claims. Re-running that model with
    sampling enabled would settle it, and Plan 3 already says so.

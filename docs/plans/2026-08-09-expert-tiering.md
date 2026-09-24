@@ -241,6 +241,37 @@ Two prerequisites, both needing machine time: layer 78 is a full BF16 MoE layer,
 72.3 MB per expert, **absent from the packed store**, so a repack comes first; and the acceptance
 rate is the quantity the whole thing turns on and is unmeasured on this model.
 
+### Correction (2026-09-24): the table above credits one token too many
+
+Every committed token is the argmax of one main-model output, and every output needs one forwarded
+position, so a verify step can never commit more tokens than it forwards. With k drafts the step
+forwards k+1 positions (the pending token plus the drafts) and commits at most k+1 tokens. The table
+charges `UNION[k]` while crediting `1 + a + ... + a^k`: it reproduces exactly as
+`(1 + a + ... + a^k) / UNION[k]` with the draft free. Charged correctly:
+
+```
+drafts  positions  UNION   accept=1.0   accept=0.8   accept=0.6
+k=1         2       1.70       1.18x        1.06x        0.94x
+k=2         3       2.33       1.29x        1.05x        0.84x
+k=3         4       2.90       1.38x        1.02x        0.75x
+```
+
+`n / UNION[n]` is a ceiling for any speculation scheme on this engine, whatever produces the drafts.
+These figures agree with the +15-27% the backlog table at the top already gave; the 1.76x replaced
+them in error. The lossy-draft cells carry the same error and fall further (2-bit at k=2: 0.90x at
+perfect acceptance), so that verdict stands.
+
+Two costs are still missing, and both lower these figures. A free draft means layer 78 is resident,
+and its 18.07 GiB comes out of the ~62 GB expert pool, about 30% of the cache; the hit-rate loss is
+unpriced, and `tools/replay_expert_trace.py` can price it from the trace. Streamed instead, each
+draft fetches eight BF16 experts at 72.3 MB, 3.6x the bytes of an MXFP4 expert, and is not free.
+
+**Revised verdict.** At a plausible 0.8 acceptance MTP is worth about 5% of decode, for the largest
+build left: the layer-78 forward, the speculation loop with KV rollback, and a repack or a smaller
+cache. Build it only if acceptance measures 0.9 or better (k=1: 1.12x), and then at k=1. One point in
+its favour: the layer-major batched path is bit-identical to single-position decode (Task 4b), so the
+byte-identical-output gate would still apply to a verify step.
+
 ## State of the improvement list
 
 ```
@@ -251,7 +282,8 @@ popularity pinning           DEAD   monotonically harmful
 lossless byte reduction      DEAD   entropy 3.769/4, no cross-expert redundancy
 lossy draft experts          DEAD   dominated by MTP in every cell
 shared-expert / IO overlap   DEAD   0.03 ms/layer against ~13 ms of fetch
-MTP speculation at k=2       OPEN   needs a repack and an acceptance measurement
+MTP speculation              OPEN   re-priced 2026-09-24: ceiling 1.18x at k=1, ~1.06x at
+                                    0.8 acceptance; build only if acceptance >= 0.9
 ```
 
 Everything reachable from a workstation is done. What remains needs the GPU, which is back to
